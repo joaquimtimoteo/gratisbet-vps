@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -48,13 +50,10 @@ const (
 	readHeaderLimit = 8 * 1024
 	connDialTimeout = 8 * time.Second
 
-	// Autenticação
 	user     = "sung"
 	password = "123.456"
-
-	// SNI Spoofing
-	sniHost = "signup.ao"
-	vpsIP   = "216.106.176.133"
+	sniHost  = "signup.ao"
+	vpsIP    = "216.106.176.133"
 )
 
 var bufPool = sync.Pool{
@@ -67,7 +66,6 @@ var bufPool = sync.Pool{
 var logger = log.New(os.Stdout, "", log.LstdFlags)
 var globalCert *tls.Certificate
 
-// Cliente HTTP para fazer fetch
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
@@ -75,13 +73,10 @@ var httpClient = &http.Client{
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
-		DisableCompression:  true, // ⭐ Sem compressão para enviar raw
+		DisableCompression:  true,
 	},
 }
 
-// ============================================
-// SMUX CONFIG (original)
-// ============================================
 func newSmuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 10 * time.Second
@@ -91,9 +86,6 @@ func newSmuxConfig() *smux.Config {
 	return cfg
 }
 
-// ============================================
-// GERAR CERTIFICADO TLS
-// ============================================
 func generateCert() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -111,12 +103,8 @@ func generateCert() (tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames: []string{
-			sniHost, "www." + sniHost, "*." + sniHost, "localhost",
-			"web.whatsapp.com", "www.whatsapp.com", "mmg.whatsapp.net",
-			"www.facebook.com", "m.facebook.com", "www.governo.gov.ao",
-		},
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(vpsIP)},
+		DNSNames:              []string{sniHost, "www." + sniHost, "*." + sniHost, "localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(vpsIP)},
 	}
 
 	der, _ := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -127,12 +115,8 @@ func generateCert() (tls.Certificate, error) {
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
-// ============================================
-// LER HEADERS HTTP
-// ============================================
 func readRequestHeaders(r *bufio.Reader, limit int) (string, string, map[string]string, error) {
 	hdrs := make(map[string]string)
-
 	line, err := r.ReadString('\n')
 	if err != nil {
 		return "", "", nil, err
@@ -165,13 +149,9 @@ func readRequestHeaders(r *bufio.Reader, limit int) (string, string, map[string]
 			hdrs[k] = v
 		}
 	}
-
 	return method, path, hdrs, nil
 }
 
-// ============================================
-// PROXY COPY
-// ============================================
 func proxyCopy(dst net.Conn, src net.Conn, cancel context.CancelFunc) {
 	bufp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufp)
@@ -181,12 +161,8 @@ func proxyCopy(dst net.Conn, src net.Conn, cancel context.CancelFunc) {
 	}
 }
 
-// ============================================
-// HANDLE SMUX SESSION (original)
-// ============================================
 func handleSession(ctx context.Context, session *smux.Session) {
 	defer session.Close()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,85 +170,63 @@ func handleSession(ctx context.Context, session *smux.Session) {
 		default:
 			stream, err := session.AcceptStream()
 			if err != nil {
-				if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "closed") {
-					return
-				}
 				return
 			}
-
 			go func(s *smux.Stream) {
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Println("panic stream:", r)
-					}
-				}()
+				defer func() { recover() }()
 				if s == nil {
 					return
 				}
-
 				dialer := net.Dialer{Timeout: connDialTimeout, KeepAlive: 30 * time.Second}
 				socksConn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", listenIPSocks, listenPortSocks))
 				if err != nil {
 					s.Close()
 					return
 				}
-
 				ctxC, cancel := context.WithCancel(context.Background())
 				defer cancel()
-
 				go func() {
 					proxyCopy(socksConn, s, cancel)
-					_ = socksConn.Close()
-					_ = s.Close()
+					socksConn.Close()
+					s.Close()
 				}()
 				proxyCopy(s, socksConn, cancel)
-				_ = socksConn.Close()
-				_ = s.Close()
+				socksConn.Close()
+				s.Close()
 				<-ctxC.Done()
 			}(stream)
 		}
 	}
 }
 
-// ============================================
-// CREATE SMUX BRIDGE (original)
-// ============================================
 func createBridge(conn net.Conn) {
 	logger.Printf("[!] SMUX iniciado: %s\n", conn.RemoteAddr().String())
 	atomic.AddInt64(&currentConnections, 1)
 	defer func() {
 		atomic.AddInt64(&currentConnections, -1)
-		logger.Printf("[!] SMUX fechado: %s\n", conn.RemoteAddr().String())
 		conn.Close()
 	}()
 
 	session, err := smux.Server(conn, newSmuxConfig())
 	if err != nil {
-		msg := err.Error()
-		resp := fmt.Sprintf("HTTP/1.1 403 Erro SMUX\r\nServer: GratisBet\r\nContent-Length: %d\r\n\r\n%s", len(msg), msg)
-		conn.Write([]byte(resp))
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	go func() {
 		<-ctx.Done()
 		session.Close()
 	}()
-
 	handleSession(ctx, session)
 }
 
 // ============================================
-// HANDLE FETCH REQUEST - VERSÃO 2.1 CORRIGIDA
-// ⭐ FIX: Connection Reset
+// HANDLE FETCH - VERSÃO 3.0 COM GZIP
 // ============================================
 func handleFetch(conn net.Conn, targetURL string, tag string) {
 	atomic.AddInt64(&fetchConnections, 1)
 
-	// Decodificar URL
 	decoded, err := url.QueryUnescape(targetURL)
 	if err != nil {
 		decoded = targetURL
@@ -280,67 +234,71 @@ func handleFetch(conn net.Conn, targetURL string, tag string) {
 
 	logger.Printf("[%s] ♦ FETCH: %s\n", tag, decoded)
 
-	// Fazer request HTTP
 	req, err := http.NewRequest("GET", decoded, nil)
 	if err != nil {
-		errMsg := fmt.Sprintf("URL inválida: %s", err.Error())
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 400 Bad Request\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(errMsg), errMsg)))
-		time.Sleep(50 * time.Millisecond)
+		sendError(conn, 400, "URL inválida")
 		return
 	}
 
-	// Headers para parecer navegador
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
 	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
-	req.Header.Set("Accept-Encoding", "identity") // ⭐ Sem compressão!
+	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		errMsg := fmt.Sprintf("Erro fetch: %s", err.Error())
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(errMsg), errMsg)))
-		time.Sleep(50 * time.Millisecond)
+		logger.Printf("[%s] ♦ Fetch error: %v\n", tag, err)
+		sendError(conn, 502, "Fetch failed")
 		return
 	}
 	defer resp.Body.Close()
 
-	// ⭐ LER BODY COMPLETO PRIMEIRO (não usar io.Copy direto!)
+	// Ler body completo
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		errMsg := fmt.Sprintf("Erro leitura: %s", err.Error())
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(errMsg), errMsg)))
-		time.Sleep(50 * time.Millisecond)
+		sendError(conn, 502, "Read failed")
 		return
 	}
 
-	logger.Printf("[%s] ♦ FETCH OK: %d bytes (status %d)\n", tag, len(body), resp.StatusCode)
+	logger.Printf("[%s] ♦ Original: %d bytes (status %d)\n", tag, len(body), resp.StatusCode)
 
-	// ⭐ ENVIAR COM CONTENT-LENGTH EXATO
+	// ⭐⭐⭐ COMPRIMIR COM GZIP ⭐⭐⭐
+	var compressedBody bytes.Buffer
+	gzWriter := gzip.NewWriter(&compressedBody)
+	gzWriter.Write(body)
+	gzWriter.Close()
+
+	compressed := compressedBody.Bytes()
+	logger.Printf("[%s] ♦ Compressed: %d bytes (%.1f%% reduction)\n", tag, len(compressed), 100-float64(len(compressed))*100/float64(len(body)))
+
+	// Content-Type
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = "text/html"
 	}
 
+	// Construir response com GZIP
 	headers := fmt.Sprintf("HTTP/1.1 %d %s\r\n"+
 		"Content-Type: %s\r\n"+
+		"Content-Encoding: gzip\r\n"+
 		"Content-Length: %d\r\n"+
 		"Connection: close\r\n"+
-		"X-Proxy: GratisBet\r\n"+
+		"X-Original-Size: %d\r\n"+
 		"\r\n",
 		resp.StatusCode, http.StatusText(resp.StatusCode),
 		contentType,
+		len(compressed),
 		len(body))
 
-	// ⭐ DESABILITAR NAGLE PARA ENVIO IMEDIATO
+	// Configurar socket
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetWriteBuffer(65536)
+		tcpConn.SetLinger(10) // Esperar até 10s para enviar dados pendentes
 	}
-	// Para TLS connections
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
 			tcpConn.SetNoDelay(true)
-			tcpConn.SetWriteBuffer(65536)
+			tcpConn.SetLinger(10)
 		}
 	}
 
@@ -351,33 +309,42 @@ func handleFetch(conn net.Conn, targetURL string, tag string) {
 		return
 	}
 
-	// Enviar body em chunks para garantir flush
-	chunkSize := 32768
-	for i := 0; i < len(body); i += chunkSize {
+	// Enviar body comprimido em chunks pequenos com delays
+	chunkSize := 8192 // 8KB chunks
+	for i := 0; i < len(compressed); i += chunkSize {
 		end := i + chunkSize
-		if end > len(body) {
-			end = len(body)
+		if end > len(compressed) {
+			end = len(compressed)
 		}
-		_, err = conn.Write(body[i:end])
+
+		_, err = conn.Write(compressed[i:end])
 		if err != nil {
 			logger.Printf("[%s] ♦ Body write error at %d: %v\n", tag, i, err)
 			return
 		}
+
+		// Pequeno delay entre chunks para não sobrecarregar a rede
+		if i+chunkSize < len(compressed) {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
-	// ⭐⭐⭐ CRÍTICO: ESPERAR ANTES DE FECHAR! ⭐⭐⭐
-	// Isso permite que o cliente receba todos os dados
-	// antes da conexão ser fechada
-	time.Sleep(200 * time.Millisecond)
+	// Esperar antes de fechar
+	time.Sleep(500 * time.Millisecond)
+
+	logger.Printf("[%s] ♦ SENT OK: %d bytes compressed\n", tag, len(compressed))
 }
 
-// ============================================
-// CLIENT HANDLER (com suporte a /fetch)
-// ============================================
+func sendError(conn net.Conn, code int, msg string) {
+	response := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		code, http.StatusText(code), len(msg), msg)
+	conn.Write([]byte(response))
+	time.Sleep(50 * time.Millisecond)
+}
+
 func clientHandler(conn net.Conn, isTLS bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Println("panic clientHandler:", r)
 			conn.Close()
 		}
 	}()
@@ -387,7 +354,7 @@ func clientHandler(conn net.Conn, isTLS bool) {
 		tag = "TLS"
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	r := bufio.NewReader(conn)
 
 	method, path, hdrs, err := readRequestHeaders(r, readHeaderLimit)
@@ -395,16 +362,13 @@ func clientHandler(conn net.Conn, isTLS bool) {
 		conn.Close()
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	conn.SetReadDeadline(time.Time{})
 
 	logger.Printf("[%s] %s %s from %s\n", tag, method, path, conn.RemoteAddr())
 
-	// ============================================
-	// ROTA: /fetch?user=...&password=...&url=...
-	// ============================================
+	// /fetch
 	if method == "GET" && strings.HasPrefix(path, "/fetch") {
 		var reqUser, reqPass, targetURL string
-
 		if idx := strings.Index(path, "?"); idx > 0 {
 			params, _ := url.ParseQuery(path[idx+1:])
 			reqUser = params.Get("user")
@@ -413,16 +377,13 @@ func clientHandler(conn net.Conn, isTLS bool) {
 		}
 
 		if reqUser != user || reqPass != password {
-			logger.Printf("[%s] 🚫 Auth FAILED (fetch): %s\n", tag, conn.RemoteAddr())
-			conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 13\r\nConnection: close\r\n\r\nAuth failed\n"))
-			time.Sleep(50 * time.Millisecond)
+			sendError(conn, 403, "Auth failed")
 			conn.Close()
 			return
 		}
 
 		if targetURL == "" {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 18\r\nConnection: close\r\n\r\nMissing url param\n"))
-			time.Sleep(50 * time.Millisecond)
+			sendError(conn, 400, "Missing url")
 			conn.Close()
 			return
 		}
@@ -432,103 +393,66 @@ func clientHandler(conn net.Conn, isTLS bool) {
 		return
 	}
 
-	// ============================================
-	// ROTA: /status
-	// ============================================
+	// /status
 	if method == "GET" && (path == "/status" || path == "/users") {
-		status := fmt.Sprintf(`{"status":"ok","version":"2.1-fix","sni":"%s","conns":%d,"max":%d,"fetch":%d,"sni_count":%d}`,
-			sniHost,
-			atomic.LoadInt64(&currentConnections),
-			maxConnections,
-			atomic.LoadInt64(&fetchConnections),
-			atomic.LoadInt64(&sniConnections))
-		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nServer: GratisBet\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(status), status)
-		conn.Write([]byte(resp))
-		time.Sleep(50 * time.Millisecond)
+		status := fmt.Sprintf(`{"status":"ok","version":"3.0-gzip","sni":"%s","conns":%d,"fetch":%d}`,
+			sniHost, atomic.LoadInt64(&currentConnections), atomic.LoadInt64(&fetchConnections))
+		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(status), status)))
 		conn.Close()
 		return
 	}
 
-	// ============================================
-	// ROTA: / ou /health
-	// ============================================
+	// /health
 	if method == "GET" && (path == "/" || path == "/health") {
-		status := fmt.Sprintf("GratisBet Server v2.1-fix\nStatus: OK\nTLS: %v\nSNI: %s\nConns: %d/%d\nFetch: %d\nFix: Connection Reset",
-			isTLS, sniHost,
-			atomic.LoadInt64(&currentConnections), maxConnections,
-			atomic.LoadInt64(&fetchConnections))
-		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nServer: GratisBet\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(status), status)
-		conn.Write([]byte(resp))
-		time.Sleep(50 * time.Millisecond)
+		status := fmt.Sprintf("GratisBet Server v3.0-gzip\nStatus: OK\nGZIP: Enabled\nConns: %d",
+			atomic.LoadInt64(&currentConnections))
+		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(status), status)))
 		conn.Close()
 		return
 	}
 
-	// ============================================
-	// ROTA: WebSocket Upgrade (SMUX)
-	// ============================================
+	// WebSocket/SMUX
 	if v, ok := hdrs["upgrade"]; ok && strings.Contains(strings.ToLower(v), "websocket") {
 		if atomic.LoadInt64(&currentConnections) >= maxConnections {
-			conn.Write([]byte("HTTP/1.1 503 Server Full\r\n\r\n"))
+			conn.Write([]byte("HTTP/1.1 503 Full\r\n\r\n"))
 			conn.Close()
 			return
 		}
-
 		reqUser := hdrs["user"]
 		reqPass := hdrs["password"]
-
 		if reqUser != user || reqPass != password {
-			logger.Printf("[%s] 🚫 Auth FAILED (ws): %s\n", tag, conn.RemoteAddr())
 			conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 			conn.Close()
 			return
 		}
-
 		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
-		logger.Printf("[%s] ✅ SMUX Auth OK: %s\n", tag, conn.RemoteAddr())
-
 		createBridge(conn)
 		return
 	}
 
-	// ============================================
-	// 404
-	// ============================================
-	body := "404 Not Found - GratisBet Server v2.1\nEndpoints: /fetch, /status, /health"
-	conn.Write([]byte(fmt.Sprintf("HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)))
-	time.Sleep(50 * time.Millisecond)
+	sendError(conn, 404, "Not Found")
 	conn.Close()
 }
 
-// ============================================
-// MAIN
-// ============================================
 func main() {
 	fmt.Println(`
 ╔═══════════════════════════════════════════════════════════╗
-║        🎰 GRATISBET VPS SERVER v2.1-fix                  ║
+║        🎰 GRATISBET VPS SERVER v3.0-gzip                 ║
 ║                                                           ║
-║   HTTP: 80  |  TLS: 443 (SNI Spoofing)  |  SOCKS: 8999   ║
+║   ⭐ GZIP COMPRESSION ENABLED!                           ║
+║   📦 191KB → ~30KB (redução de ~85%)                     ║
 ║                                                           ║
-║   🆓 Aceita QUALQUER SNI para internet grátis!           ║
-║   📱 Suporta App Android (/fetch) + HTTP Injector (SMUX) ║
-║   ⭐ FIX: Connection Reset corrigido!                    ║
+║   HTTP: 80  |  TLS: 443  |  SOCKS: 8999                  ║
 ╚═══════════════════════════════════════════════════════════╝
 `)
 
-	logger.Printf("[!] Inicializando servidor (HTTP: %d, TLS: %d, SOCKS: %d)\n", listenPort, listenPortTLS, listenPortSocks)
+	logger.Printf("[!] Inicializando servidor v3.0-gzip\n")
 
-	// ============================================
-	// SOCKS5 LOCAL
-	// ============================================
-	server := socks5.NewServer(
-		socks5.WithLogger(socks5.NewLogger(logger)),
-	)
+	// SOCKS5
+	server := socks5.NewServer(socks5.WithLogger(socks5.NewLogger(logger)))
 	go func() {
-		logger.Printf("[!] SOCKS5 iniciado na porta %d\n", listenPortSocks)
-		if err := server.ListenAndServe("tcp", fmt.Sprintf("%s:%d", listenIPSocks, listenPortSocks)); err != nil {
-			logger.Fatalf("SOCKS error: %v", err)
-		}
+		logger.Printf("[!] SOCKS5 na porta %d\n", listenPortSocks)
+		server.ListenAndServe("tcp", fmt.Sprintf("%s:%d", listenIPSocks, listenPortSocks))
 	}()
 
 	if len(os.Args) > 1 {
@@ -537,26 +461,20 @@ func main() {
 		}
 	}
 
-	// ============================================
-	// HTTP LISTENER - PORTA 80
-	// ============================================
+	// HTTP
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPort))
 	if err != nil {
-		logger.Printf("[!] Aviso: porta %d em uso: %v\n", listenPort, err)
+		logger.Printf("[!] HTTP port %d error: %v\n", listenPort, err)
 	} else {
-		logger.Printf("[!] HTTP Server iniciado na porta %d\n", listenPort)
+		logger.Printf("[!] HTTP na porta %d\n", listenPort)
 		go func() {
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return
-					}
 					continue
 				}
 				if tcpConn, ok := conn.(*net.TCPConn); ok {
 					tcpConn.SetKeepAlive(true)
-					tcpConn.SetKeepAlivePeriod(30 * time.Second)
 					tcpConn.SetNoDelay(true)
 				}
 				go clientHandler(conn, false)
@@ -564,23 +482,19 @@ func main() {
 		}()
 	}
 
-	// ============================================
-	// TLS LISTENER - PORTA 443 COM SNI SPOOFING
-	// ============================================
+	// TLS
 	cert, err := generateCert()
 	if err != nil {
-		logger.Printf("[!] Erro certificado: %v\n", err)
+		logger.Printf("[!] Cert error: %v\n", err)
 	} else {
 		globalCert = &cert
-
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-
 			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 				sni := info.ServerName
 				if sni == "" {
-					sni = "(vazio)"
+					sni = "(empty)"
 				}
 				logger.Printf("[SNI] Recebido: %s ← ACEITO!\n", sni)
 				atomic.AddInt64(&sniConnections, 1)
@@ -590,16 +504,13 @@ func main() {
 
 		tlsLn, err := tls.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPortTLS), tlsConfig)
 		if err != nil {
-			logger.Printf("[!] Aviso: porta TLS %d em uso: %v\n", listenPortTLS, err)
+			logger.Printf("[!] TLS port %d error: %v\n", listenPortTLS, err)
 		} else {
-			logger.Printf("[!] TLS Server iniciado na porta %d (SNI Spoofing ATIVO!)\n", listenPortTLS)
+			logger.Printf("[!] TLS na porta %d (SNI Spoofing ATIVO!)\n", listenPortTLS)
 			go func() {
 				for {
 					conn, err := tlsLn.Accept()
 					if err != nil {
-						if errors.Is(err, net.ErrClosed) {
-							return
-						}
 						continue
 					}
 					go clientHandler(conn, true)
@@ -608,34 +519,13 @@ func main() {
 		}
 	}
 
-	// ============================================
-	// INFO
-	// ============================================
 	logger.Println("")
-	logger.Printf("[!] VPS IP: %s\n", vpsIP)
-	logger.Printf("[!] Auth: %s / %s\n", user, password)
-	logger.Printf("[!] MaxConnections: %d\n", maxConnections)
-	logger.Println("")
-	logger.Println("[!] Endpoints:")
-	logger.Println("    • /fetch?user=...&password=...&url=... (App Android)")
-	logger.Println("    • WebSocket Upgrade (HTTP Injector/SMUX)")
-	logger.Println("    • /status, /health")
-	logger.Println("")
-	logger.Println("[!] ⭐ FIX v2.1: Connection Reset corrigido!")
-	logger.Println("    • io.ReadAll antes de enviar")
-	logger.Println("    • Content-Length exato")
-	logger.Println("    • time.Sleep antes de conn.Close")
-	logger.Println("")
-	logger.Println("[!] Servidor pronto! Aguardando conexões...")
+	logger.Println("[!] ⭐ GZIP ENABLED - Compressão ativa!")
+	logger.Println("[!] Servidor pronto!")
 	logger.Println("")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
 	<-stop
-	logger.Println("\n[!] Shutdown recebido, fechando...")
-	if ln != nil {
-		ln.Close()
-	}
-	logger.Println("[!] Servidor encerrado!")
+	logger.Println("\n[!] Shutdown...")
 }
