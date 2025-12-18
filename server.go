@@ -200,7 +200,6 @@ func handleSession(ctx context.Context, session *smux.Session) {
 }
 
 func createBridge(conn net.Conn) {
-	logger.Printf("[!] SMUX iniciado: %s\n", conn.RemoteAddr().String())
 	atomic.AddInt64(&currentConnections, 1)
 	defer func() {
 		atomic.AddInt64(&currentConnections, -1)
@@ -222,7 +221,8 @@ func createBridge(conn net.Conn) {
 }
 
 // ============================================
-// HANDLE FETCH - VERSÃO 3.0 COM GZIP
+// HANDLE FETCH - v3.1 SLOW CHUNKS
+// Envia em chunks muito pequenos com delays
 // ============================================
 func handleFetch(conn net.Conn, targetURL string, tag string) {
 	atomic.AddInt64(&fetchConnections, 1)
@@ -241,8 +241,8 @@ func handleFetch(conn net.Conn, targetURL string, tag string) {
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
-	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
+	req.Header.Set("Accept", "text/html,*/*")
+	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9")
 	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := httpClient.Do(req)
@@ -253,86 +253,113 @@ func handleFetch(conn net.Conn, targetURL string, tag string) {
 	}
 	defer resp.Body.Close()
 
-	// Ler body completo
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		sendError(conn, 502, "Read failed")
 		return
 	}
 
-	logger.Printf("[%s] ♦ Original: %d bytes (status %d)\n", tag, len(body), resp.StatusCode)
+	logger.Printf("[%s] ♦ Original: %d bytes\n", tag, len(body))
 
-	// ⭐⭐⭐ COMPRIMIR COM GZIP ⭐⭐⭐
+	// ⭐ COMPRIMIR COM GZIP MÁXIMO
 	var compressedBody bytes.Buffer
-	gzWriter := gzip.NewWriter(&compressedBody)
+	gzWriter, _ := gzip.NewWriterLevel(&compressedBody, gzip.BestCompression)
 	gzWriter.Write(body)
 	gzWriter.Close()
 
 	compressed := compressedBody.Bytes()
-	logger.Printf("[%s] ♦ Compressed: %d bytes (%.1f%% reduction)\n", tag, len(compressed), 100-float64(len(compressed))*100/float64(len(body)))
+	reduction := 100 - float64(len(compressed))*100/float64(len(body))
+	logger.Printf("[%s] ♦ Compressed: %d bytes (%.1f%% reduction)\n", tag, len(compressed), reduction)
 
-	// Content-Type
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
-		contentType = "text/html"
+		contentType = "text/html; charset=utf-8"
 	}
 
-	// Construir response com GZIP
+	// ⭐ USAR CHUNKED TRANSFER ENCODING
+	// Em vez de Content-Length, usar Transfer-Encoding: chunked
+	// Isso permite enviar em pedaços pequenos
 	headers := fmt.Sprintf("HTTP/1.1 %d %s\r\n"+
 		"Content-Type: %s\r\n"+
 		"Content-Encoding: gzip\r\n"+
-		"Content-Length: %d\r\n"+
-		"Connection: close\r\n"+
+		"Transfer-Encoding: chunked\r\n"+
+		"Connection: keep-alive\r\n"+
 		"X-Original-Size: %d\r\n"+
 		"\r\n",
 		resp.StatusCode, http.StatusText(resp.StatusCode),
 		contentType,
-		len(compressed),
 		len(body))
 
-	// Configurar socket
+	// Configurar socket para envio lento
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetLinger(10) // Esperar até 10s para enviar dados pendentes
+		tcpConn.SetNoDelay(false) // Usar Nagle algorithm para agrupar pequenos pacotes
+		tcpConn.SetWriteBuffer(4096)
 	}
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetLinger(10)
+			tcpConn.SetNoDelay(false)
+			tcpConn.SetWriteBuffer(4096)
 		}
 	}
 
 	// Enviar headers
 	_, err = conn.Write([]byte(headers))
 	if err != nil {
-		logger.Printf("[%s] ♦ Header write error: %v\n", tag, err)
+		logger.Printf("[%s] ♦ Header error: %v\n", tag, err)
 		return
 	}
 
-	// Enviar body comprimido em chunks pequenos com delays
-	chunkSize := 8192 // 8KB chunks
+	// ⭐⭐⭐ ENVIAR EM CHUNKS MUITO PEQUENOS (512 bytes) COM DELAYS ⭐⭐⭐
+	chunkSize := 512
+	totalSent := 0
+
 	for i := 0; i < len(compressed); i += chunkSize {
 		end := i + chunkSize
 		if end > len(compressed) {
 			end = len(compressed)
 		}
 
-		_, err = conn.Write(compressed[i:end])
+		chunk := compressed[i:end]
+		
+		// Formato chunked: tamanho em hex + CRLF + dados + CRLF
+		chunkHeader := fmt.Sprintf("%x\r\n", len(chunk))
+		
+		_, err = conn.Write([]byte(chunkHeader))
 		if err != nil {
-			logger.Printf("[%s] ♦ Body write error at %d: %v\n", tag, i, err)
+			logger.Printf("[%s] ♦ Chunk header error at %d: %v\n", tag, i, err)
+			return
+		}
+		
+		_, err = conn.Write(chunk)
+		if err != nil {
+			logger.Printf("[%s] ♦ Chunk data error at %d: %v\n", tag, i, err)
+			return
+		}
+		
+		_, err = conn.Write([]byte("\r\n"))
+		if err != nil {
+			logger.Printf("[%s] ♦ Chunk end error at %d: %v\n", tag, i, err)
 			return
 		}
 
-		// Pequeno delay entre chunks para não sobrecarregar a rede
-		if i+chunkSize < len(compressed) {
-			time.Sleep(10 * time.Millisecond)
+		totalSent += len(chunk)
+
+		// ⭐ DELAY ENTRE CHUNKS - parecer tráfego normal
+		time.Sleep(20 * time.Millisecond)
+
+		// Log a cada 10KB
+		if totalSent%(10*1024) < chunkSize {
+			logger.Printf("[%s] ♦ Sent: %d/%d bytes\n", tag, totalSent, len(compressed))
 		}
 	}
 
-	// Esperar antes de fechar
-	time.Sleep(500 * time.Millisecond)
+	// Chunk final (0 = fim)
+	conn.Write([]byte("0\r\n\r\n"))
 
-	logger.Printf("[%s] ♦ SENT OK: %d bytes compressed\n", tag, len(compressed))
+	// Esperar antes de fechar
+	time.Sleep(1 * time.Second)
+
+	logger.Printf("[%s] ♦ SENT OK: %d bytes in %d chunks\n", tag, totalSent, (len(compressed)/chunkSize)+1)
 }
 
 func sendError(conn net.Conn, code int, msg string) {
@@ -366,7 +393,6 @@ func clientHandler(conn net.Conn, isTLS bool) {
 
 	logger.Printf("[%s] %s %s from %s\n", tag, method, path, conn.RemoteAddr())
 
-	// /fetch
 	if method == "GET" && strings.HasPrefix(path, "/fetch") {
 		var reqUser, reqPass, targetURL string
 		if idx := strings.Index(path, "?"); idx > 0 {
@@ -393,25 +419,21 @@ func clientHandler(conn net.Conn, isTLS bool) {
 		return
 	}
 
-	// /status
 	if method == "GET" && (path == "/status" || path == "/users") {
-		status := fmt.Sprintf(`{"status":"ok","version":"3.0-gzip","sni":"%s","conns":%d,"fetch":%d}`,
-			sniHost, atomic.LoadInt64(&currentConnections), atomic.LoadInt64(&fetchConnections))
+		status := fmt.Sprintf(`{"status":"ok","version":"3.1-slow","conns":%d,"fetch":%d}`,
+			atomic.LoadInt64(&currentConnections), atomic.LoadInt64(&fetchConnections))
 		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(status), status)))
 		conn.Close()
 		return
 	}
 
-	// /health
 	if method == "GET" && (path == "/" || path == "/health") {
-		status := fmt.Sprintf("GratisBet Server v3.0-gzip\nStatus: OK\nGZIP: Enabled\nConns: %d",
-			atomic.LoadInt64(&currentConnections))
+		status := "GratisBet v3.1-slow\nGZIP+Chunked+Slow"
 		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(status), status)))
 		conn.Close()
 		return
 	}
 
-	// WebSocket/SMUX
 	if v, ok := hdrs["upgrade"]; ok && strings.Contains(strings.ToLower(v), "websocket") {
 		if atomic.LoadInt64(&currentConnections) >= maxConnections {
 			conn.Write([]byte("HTTP/1.1 503 Full\r\n\r\n"))
@@ -437,21 +459,21 @@ func clientHandler(conn net.Conn, isTLS bool) {
 func main() {
 	fmt.Println(`
 ╔═══════════════════════════════════════════════════════════╗
-║        🎰 GRATISBET VPS SERVER v3.0-gzip                 ║
+║        🎰 GRATISBET VPS SERVER v3.1-slow                 ║
 ║                                                           ║
-║   ⭐ GZIP COMPRESSION ENABLED!                           ║
-║   📦 191KB → ~30KB (redução de ~85%)                     ║
+║   ⭐ GZIP + CHUNKED + SLOW TRANSFER                      ║
+║   📦 512 byte chunks with 20ms delays                    ║
+║   🐢 Simula tráfego normal de navegação                  ║
 ║                                                           ║
 ║   HTTP: 80  |  TLS: 443  |  SOCKS: 8999                  ║
 ╚═══════════════════════════════════════════════════════════╝
 `)
 
-	logger.Printf("[!] Inicializando servidor v3.0-gzip\n")
+	logger.Println("[!] Servidor v3.1-slow iniciando...")
 
-	// SOCKS5
 	server := socks5.NewServer(socks5.WithLogger(socks5.NewLogger(logger)))
 	go func() {
-		logger.Printf("[!] SOCKS5 na porta %d\n", listenPortSocks)
+		logger.Printf("[!] SOCKS5 porta %d\n", listenPortSocks)
 		server.ListenAndServe("tcp", fmt.Sprintf("%s:%d", listenIPSocks, listenPortSocks))
 	}()
 
@@ -461,71 +483,54 @@ func main() {
 		}
 	}
 
-	// HTTP
-	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPort))
-	if err != nil {
-		logger.Printf("[!] HTTP port %d error: %v\n", listenPort, err)
-	} else {
-		logger.Printf("[!] HTTP na porta %d\n", listenPort)
+	ln, _ := net.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPort))
+	if ln != nil {
+		logger.Printf("[!] HTTP porta %d\n", listenPort)
 		go func() {
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
 					continue
 				}
-				if tcpConn, ok := conn.(*net.TCPConn); ok {
-					tcpConn.SetKeepAlive(true)
-					tcpConn.SetNoDelay(true)
-				}
 				go clientHandler(conn, false)
 			}
 		}()
 	}
 
-	// TLS
-	cert, err := generateCert()
-	if err != nil {
-		logger.Printf("[!] Cert error: %v\n", err)
-	} else {
-		globalCert = &cert
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				sni := info.ServerName
-				if sni == "" {
-					sni = "(empty)"
-				}
-				logger.Printf("[SNI] Recebido: %s ← ACEITO!\n", sni)
-				atomic.AddInt64(&sniConnections, 1)
-				return globalCert, nil
-			},
-		}
-
-		tlsLn, err := tls.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPortTLS), tlsConfig)
-		if err != nil {
-			logger.Printf("[!] TLS port %d error: %v\n", listenPortTLS, err)
-		} else {
-			logger.Printf("[!] TLS na porta %d (SNI Spoofing ATIVO!)\n", listenPortTLS)
-			go func() {
-				for {
-					conn, err := tlsLn.Accept()
-					if err != nil {
-						continue
-					}
-					go clientHandler(conn, true)
-				}
-			}()
-		}
+	cert, _ := generateCert()
+	globalCert = &cert
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			sni := info.ServerName
+			if sni == "" {
+				sni = "(empty)"
+			}
+			logger.Printf("[SNI] Recebido: %s ← ACEITO!\n", sni)
+			atomic.AddInt64(&sniConnections, 1)
+			return globalCert, nil
+		},
 	}
 
-	logger.Println("")
-	logger.Println("[!] ⭐ GZIP ENABLED - Compressão ativa!")
+	tlsLn, _ := tls.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPortTLS), tlsConfig)
+	if tlsLn != nil {
+		logger.Printf("[!] TLS porta %d (SNI Spoofing ATIVO!)\n", listenPortTLS)
+		go func() {
+			for {
+				conn, err := tlsLn.Accept()
+				if err != nil {
+					continue
+				}
+				go clientHandler(conn, true)
+			}
+		}()
+	}
+
+	logger.Println("[!] 🐢 Modo SLOW: chunks de 512 bytes + 20ms delay")
 	logger.Println("[!] Servidor pronto!")
-	logger.Println("")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	logger.Println("\n[!] Shutdown...")
 }
