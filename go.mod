@@ -1,3 +1,10 @@
-module gratisbet-vps
+module igrisserver
 
-go 1.21
+go 1.23.4
+
+require (
+	github.com/things-go/go-socks5 v0.0.5
+	github.com/xtaci/smux v1.5.34
+)
+
+require golang.org/x/net v0.20.0 // indirect
