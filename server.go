@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/gzip"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -70,16 +69,17 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	logger.Printf("[SEARCH] Query: %s", query)
 
 	// Buscar no Google
-	googleURL := fmt.Sprintf("https://www.google.com/search?q=%s&hl=pt", url.QueryEscape(query))
+	googleURL := fmt.Sprintf("https://www.google.com/search?q=%s&hl=pt&num=5", url.QueryEscape(query))
 	
 	req, _ := http.NewRequest("GET", googleURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
 	
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		logger.Printf("[SEARCH] Error: %v", err)
-		w.Write([]byte("ERRO|Falha na busca"))
+		logger.Printf("[SEARCH] Google error: %v", err)
+		w.Write([]byte(fmt.Sprintf("OK|%s|0\nErro ao buscar: %v", query, err)))
 		return
 	}
 	defer resp.Body.Close()
@@ -87,10 +87,17 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 	
-	// Extrair resultados
+	logger.Printf("[SEARCH] Google returned %d bytes", len(html))
+	
+	// Extrair resultados com múltiplos padrões
 	results := extractSearchResults(html)
 	
-	// Formatar resposta compacta (< 500 bytes)
+	// Se não encontrou resultados, tentar padrão alternativo
+	if len(results) == 0 {
+		results = extractAlternativeResults(html)
+	}
+	
+	// Formatar resposta compacta (< 450 bytes)
 	response := formatCompactResults(query, results)
 	
 	logger.Printf("[SEARCH] Results: %d, Size: %d bytes", len(results), len(response))
@@ -101,45 +108,80 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 
 type SearchResult struct {
 	Title string
-	URL   string
-	Desc  string
 }
 
 func extractSearchResults(html string) []SearchResult {
 	var results []SearchResult
 	
-	// Padrão para extrair títulos e links dos resultados do Google
-	// Google usa <h3> para títulos de resultados
-	titleRegex := regexp.MustCompile(`<h3[^>]*>([^<]+)</h3>`)
-	linkRegex := regexp.MustCompile(`<a href="/url\?q=([^&"]+)`)
+	// Padrão 1: Títulos em <h3>
+	h3Regex := regexp.MustCompile(`<h3[^>]*class="[^"]*"[^>]*>([^<]+)</h3>`)
+	matches := h3Regex.FindAllStringSubmatch(html, 10)
 	
-	titles := titleRegex.FindAllStringSubmatch(html, 10)
-	links := linkRegex.FindAllStringSubmatch(html, 10)
-	
-	for i := 0; i < len(titles) && i < 5; i++ {
-		result := SearchResult{
-			Title: cleanText(titles[i][1]),
+	for _, m := range matches {
+		title := cleanText(m[1])
+		if len(title) > 10 && len(title) < 100 {
+			results = append(results, SearchResult{Title: title})
 		}
-		if i < len(links) {
-			result.URL = links[i][1]
-		}
-		if result.Title != "" && len(result.Title) > 5 {
-			results = append(results, result)
+		if len(results) >= 5 {
+			break
 		}
 	}
 	
-	// Se não encontrou com o padrão acima, tentar outro
+	// Padrão 2: Se não encontrou, tentar <h3> simples
 	if len(results) == 0 {
-		// Padrão alternativo
-		altRegex := regexp.MustCompile(`<div class="[^"]*">([^<]{20,100})</div>`)
-		matches := altRegex.FindAllStringSubmatch(html, 10)
-		for i, m := range matches {
-			if i >= 5 {
+		h3Simple := regexp.MustCompile(`<h3[^>]*>([^<]{10,80})</h3>`)
+		matches = h3Simple.FindAllStringSubmatch(html, 10)
+		for _, m := range matches {
+			title := cleanText(m[1])
+			if len(title) > 10 {
+				results = append(results, SearchResult{Title: title})
+			}
+			if len(results) >= 5 {
 				break
 			}
-			text := cleanText(m[1])
-			if len(text) > 20 && !strings.Contains(text, "{") {
+		}
+	}
+	
+	return results
+}
+
+func extractAlternativeResults(html string) []SearchResult {
+	var results []SearchResult
+	
+	// Padrão alternativo: divs com texto longo
+	divRegex := regexp.MustCompile(`<div[^>]*>([A-Z][^<]{20,80})</div>`)
+	matches := divRegex.FindAllStringSubmatch(html, 20)
+	
+	seen := make(map[string]bool)
+	for _, m := range matches {
+		text := cleanText(m[1])
+		// Filtrar textos que parecem resultados de busca
+		if len(text) > 20 && len(text) < 80 && !seen[text] {
+			// Evitar JavaScript, CSS, etc
+			if !strings.Contains(text, "{") && !strings.Contains(text, "function") && !strings.Contains(text, "var ") {
+				seen[text] = true
 				results = append(results, SearchResult{Title: text})
+			}
+		}
+		if len(results) >= 5 {
+			break
+		}
+	}
+	
+	// Se ainda não encontrou, extrair qualquer texto significativo
+	if len(results) == 0 {
+		// Buscar por padrões de texto entre tags
+		textRegex := regexp.MustCompile(`>([A-Z][a-záàâãéèêíïóôõöúçñ\s]{15,60}[.!?]?)<`)
+		matches = textRegex.FindAllStringSubmatch(html, 30)
+		
+		for _, m := range matches {
+			text := cleanText(m[1])
+			if len(text) > 15 && !seen[text] {
+				seen[text] = true
+				results = append(results, SearchResult{Title: text})
+			}
+			if len(results) >= 5 {
+				break
 			}
 		}
 	}
@@ -158,7 +200,8 @@ func cleanText(s string) string {
 	s = strings.ReplaceAll(s, "&lt;", "<")
 	s = strings.ReplaceAll(s, "&gt;", ">")
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
-	// Trim
+	// Limpar espaços extras
+	s = strings.Join(strings.Fields(s), " ")
 	s = strings.TrimSpace(s)
 	return s
 }
@@ -166,28 +209,26 @@ func cleanText(s string) string {
 func formatCompactResults(query string, results []SearchResult) string {
 	var sb strings.Builder
 	
-	// Formato: QUERY|NUM_RESULTS\nTITLE1\nTITLE2\n...
 	sb.WriteString(fmt.Sprintf("OK|%s|%d\n", query, len(results)))
 	
 	for i, r := range results {
-		// Limitar título a 60 chars
 		title := r.Title
-		if len(title) > 60 {
-			title = title[:57] + "..."
+		if len(title) > 55 {
+			title = title[:52] + "..."
 		}
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, title))
 	}
 	
-	// Se não houver resultados
 	if len(results) == 0 {
 		sb.WriteString("Nenhum resultado encontrado.\n")
+		sb.WriteString("Tente outra busca.\n")
 	}
 	
 	result := sb.String()
 	
-	// Garantir que não excede 450 bytes
-	if len(result) > 450 {
-		result = result[:450]
+	// Garantir que não excede 430 bytes
+	if len(result) > 430 {
+		result = result[:430]
 	}
 	
 	return result
@@ -207,7 +248,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	reqPass := query.Get("password")
 	
 	if reqUser != user || reqPass != password {
-		// Permitir /status sem auth
 		if path != "/status" && path != "/" && path != "/health" {
 			http.Error(w, "Auth failed", http.StatusForbidden)
 			return
@@ -218,76 +258,38 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	case path == "/search":
 		q := query.Get("q")
 		if q == "" {
-			w.Write([]byte("ERRO|Query vazia"))
+			w.Write([]byte("OK||0\nQuery vazia"))
 			return
 		}
 		handleSearch(w, r, q)
 		
-	case path == "/fetch":
-		targetURL := query.Get("url")
-		if targetURL == "" {
-			http.Error(w, "Missing url", http.StatusBadRequest)
-			return
-		}
-		handleFetch(w, r, targetURL)
-		
 	case path == "/status" || path == "/" || path == "/health":
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","version":"6.0-search"}`))
+		w.Write([]byte(`{"status":"ok","version":"6.2-search"}`))
 		
 	default:
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
 }
 
-// Fetch normal (para testes)
-func handleFetch(w http.ResponseWriter, r *http.Request, targetURL string) {
-	decoded, _ := url.QueryUnescape(targetURL)
-	if decoded != "" {
-		targetURL = decoded
-	}
-	
-	logger.Printf("[FETCH] %s", targetURL)
-	
-	req, _ := http.NewRequest("GET", targetURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
-	req.Header.Set("Accept-Encoding", "gzip")
-	
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	
-	body, _ := io.ReadAll(resp.Body)
-	
-	// Comprimir
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-	w.Header().Set("Content-Encoding", "gzip")
-	
-	gz := gzip.NewWriter(w)
-	gz.Write(body)
-	gz.Close()
-}
-
 func main() {
 	fmt.Println(`
 ╔═══════════════════════════════════════════════════════════╗
-║        🔍 GRATISBET SEARCH SERVER v6.0                   ║
+║        🔍 GRATISBET SEARCH SERVER v6.2                   ║
 ║                                                           ║
-║   /search?q=...  → Busca Google (< 500 bytes)            ║
-║   /fetch?url=... → Fetch normal                          ║
+║   /search?q=...  → Busca Google (< 450 bytes)            ║
 ║   /status        → Health check                          ║
 ║                                                           ║
 ║   HTTP: 80  |  TLS: 443                                  ║
 ╚═══════════════════════════════════════════════════════════╝`)
 
 	// HTTP Server
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/", handleRequest)
+	
 	go func() {
-		http.HandleFunc("/", handleRequest)
 		logger.Println("[!] HTTP porta 80")
-		http.ListenAndServe(fmt.Sprintf("%s:%d", listenIP, listenPort), nil)
+		http.ListenAndServe(fmt.Sprintf("%s:%d", listenIP, listenPort), httpMux)
 	}()
 
 	// TLS Server
@@ -301,58 +303,23 @@ func main() {
 		},
 	}
 
-	tlsListener, err := tls.Listen("tcp", fmt.Sprintf("%s:%d", listenIP, listenPortTLS), tlsConfig)
-	if err != nil {
-		logger.Fatal(err)
+	tlsMux := http.NewServeMux()
+	tlsMux.HandleFunc("/", handleRequest)
+
+	tlsServer := &http.Server{
+		Addr:      fmt.Sprintf("%s:%d", listenIP, listenPortTLS),
+		Handler:   tlsMux,
+		TLSConfig: tlsConfig,
 	}
 
 	go func() {
 		logger.Println("[!] TLS porta 443")
-		for {
-			conn, err := tlsListener.Accept()
-			if err != nil {
-				continue
-			}
-			go handleTLSConn(conn)
-		}
+		tlsServer.ListenAndServeTLS("", "")
 	}()
 
-	logger.Println("[!] Servidor v6.0 pronto!")
+	logger.Println("[!] Servidor v6.2 pronto!")
 	
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-}
-
-func handleTLSConn(conn net.Conn) {
-	defer conn.Close()
-	
-	// Usar http.Server para processar a conexão
-	server := &http.Server{
-		Handler: http.HandlerFunc(handleRequest),
-	}
-	
-	// Criar um listener fake com uma conexão
-	server.Serve(&singleConnListener{conn: conn})
-}
-
-type singleConnListener struct {
-	conn   net.Conn
-	served bool
-}
-
-func (l *singleConnListener) Accept() (net.Conn, error) {
-	if l.served {
-		return nil, fmt.Errorf("closed")
-	}
-	l.served = true
-	return l.conn, nil
-}
-
-func (l *singleConnListener) Close() error {
-	return nil
-}
-
-func (l *singleConnListener) Addr() net.Addr {
-	return l.conn.LocalAddr()
 }
