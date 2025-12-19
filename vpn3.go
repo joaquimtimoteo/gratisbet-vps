@@ -22,7 +22,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const SEND_DELAY = 40 * time.Millisecond
+const (
+	SEND_DELAY = 40 * time.Millisecond
+	MAX_CHUNK  = 200  // Fragmentar em 200 bytes
+)
 
 var logger = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -44,7 +47,6 @@ func (s *Session) sendFrame(id uint16, data []byte) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	
-	// DELAY OBRIGATÓRIO
 	elapsed := time.Since(s.lastSend)
 	if elapsed < SEND_DELAY {
 		time.Sleep(SEND_DELAY - elapsed)
@@ -109,7 +111,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 			logger.Printf("[CONNECT] OK id=%d", id)
 
 			go func(id uint16, st *Stream) {
-				buf := make([]byte, 300)
+				buf := make([]byte, MAX_CHUNK)  // Ler em chunks pequenos
 				for !st.closed {
 					st.target.SetReadDeadline(time.Now().Add(30 * time.Second))
 					n, err := st.target.Read(buf)
@@ -154,7 +156,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	fmt.Println("VPN v3.2 - Delay 40ms")
+	fmt.Println("VPN v3.3 - Chunks 200 bytes")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vpn", handleVPN)
 	go http.ListenAndServe(":80", mux)
