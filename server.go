@@ -62,14 +62,17 @@ func generateCert() (tls.Certificate, error) {
 func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	logger.Printf("[SEARCH] Query: %s", query)
 
-	googleURL := fmt.Sprintf("https://www.google.com/search?q=%s&hl=pt", url.QueryEscape(query))
+	// Usar DuckDuckGo HTML (mais fácil de fazer scraping)
+	ddgURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", url.QueryEscape(query))
 	
-	req, _ := http.NewRequest("GET", googleURL, nil)
+	req, _ := http.NewRequest("GET", ddgURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html")
 	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9")
 	
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		logger.Printf("[SEARCH] Error: %v", err)
 		w.Write([]byte(fmt.Sprintf("OK|%s|0\nErro: %v", query, err)))
 		return
 	}
@@ -78,22 +81,25 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 	
-	logger.Printf("[SEARCH] Google: %d bytes", len(html))
+	logger.Printf("[SEARCH] DDG: %d bytes", len(html))
 	
-	// DEBUG: salvar HTML
-	os.WriteFile("/tmp/google.html", body, 0644)
-	logger.Printf("[DEBUG] Salvo /tmp/google.html")
+	// Debug
+	os.WriteFile("/tmp/ddg.html", body, 0644)
 	
-	results := extractResults(html)
+	// Extrair resultados do DuckDuckGo
+	results := extractDDGResults(html)
 	
+	// Formatar resposta
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("OK|%s|%d\n", query, len(results)))
+	
 	for i, r := range results {
 		if len(r) > 50 {
 			r = r[:47] + "..."
 		}
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, r))
 	}
+	
 	if len(results) == 0 {
 		sb.WriteString("Sem resultados.\n")
 	}
@@ -104,28 +110,31 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	}
 	
 	logger.Printf("[SEARCH] Results: %d, Size: %d", len(results), len(response))
+	
 	w.Write([]byte(response))
 }
 
-func extractResults(html string) []string {
+func extractDDGResults(html string) []string {
 	var results []string
 	seen := make(map[string]bool)
 	
+	// DuckDuckGo usa class="result__a" para links de resultados
 	patterns := []string{
-		`<h3[^>]*>([^<]{10,100})</h3>`,
-		`class="[^"]*LC20lb[^"]*"[^>]*>([^<]{10,100})<`,
-		`class="[^"]*DKV0Md[^"]*"[^>]*>([^<]{10,100})<`,
-		`class="[^"]*BNeawe[^"]*"[^>]*>([^<]{10,100})<`,
-		`<a[^>]*href="/url[^"]*"[^>]*>([^<]{10,80})</a>`,
-		`<span[^>]*>([A-Z][^<]{20,80})</span>`,
+		`class="result__a"[^>]*>([^<]{10,100})</a>`,
+		`class="result__title"[^>]*>([^<]{10,100})<`,
+		`class="result__snippet"[^>]*>([^<]{10,100})<`,
+		`<a[^>]*class="[^"]*result[^"]*"[^>]*>([^<]{10,80})</a>`,
+		`<h2[^>]*>([^<]{10,80})</h2>`,
 	}
 	
 	for _, pattern := range patterns {
 		if len(results) >= 5 {
 			break
 		}
+		
 		re := regexp.MustCompile(pattern)
 		matches := re.FindAllStringSubmatch(html, 20)
+		
 		for _, m := range matches {
 			if len(m) > 1 {
 				text := cleanText(m[1])
@@ -141,21 +150,6 @@ func extractResults(html string) []string {
 		}
 	}
 	
-	if len(results) == 0 {
-		re := regexp.MustCompile(`>([A-Z][a-zA-Z\s]{15,70})<`)
-		matches := re.FindAllStringSubmatch(html, 100)
-		for _, m := range matches {
-			text := cleanText(m[1])
-			if isValid(text) && !seen[text] {
-				seen[text] = true
-				results = append(results, text)
-			}
-			if len(results) >= 5 {
-				break
-			}
-		}
-	}
-	
 	return results
 }
 
@@ -164,6 +158,8 @@ func cleanText(s string) string {
 	s = strings.ReplaceAll(s, "&quot;", "\"")
 	s = strings.ReplaceAll(s, "&#39;", "'")
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	s = strings.ReplaceAll(s, "<b>", "")
+	s = strings.ReplaceAll(s, "</b>", "")
 	return strings.TrimSpace(s)
 }
 
@@ -171,7 +167,7 @@ func isValid(s string) bool {
 	if len(s) < 10 || len(s) > 100 {
 		return false
 	}
-	bad := []string{"{", "function", "var ", "window", "document", "google", "Pesquisar", "login"}
+	bad := []string{"{", "function", "var ", "window", "document", "duckduckgo", "Pesquisar"}
 	for _, b := range bad {
 		if strings.Contains(strings.ToLower(s), b) {
 			return false
@@ -205,11 +201,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.Write([]byte(`{"v":"6.4"}`))
+	w.Write([]byte(`{"v":"6.5-ddg"}`))
 }
 
 func main() {
-	fmt.Println("🔍 GRATISBET v6.4")
+	fmt.Println("🔍 GRATISBET v6.5 (DuckDuckGo)")
 
 	go func() {
 		logger.Println("[HTTP] :80")
