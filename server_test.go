@@ -47,12 +47,13 @@ func generateCert() tls.Certificate {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	t := x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "signup.ao"}, NotBefore: time.Now(), NotAfter: time.Now().Add(10*365*24*time.Hour), DNSNames: []string{"signup.ao", "www.signup.ao"}, IPAddresses: []net.IP{net.ParseIP("216.106.176.133")}}
 	der, _ := x509.CreateCertificate(rand.Reader, &t, &t, &key.PublicKey, key)
-	cert, _ := tls.X509KeyPair(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: func() []byte { b, _ := x509.MarshalPKCS8PrivateKey(key); return b }()}))
+	keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
+	cert, _ := tls.X509KeyPair(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}))
 	return cert
 }
 
 func main() {
-	fmt.Println("🧪 TESTE WEBSOCKET ECHO")
+	fmt.Println("TESTE WEBSOCKET ECHO")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/test", handleTest)
 	go http.ListenAndServe(":80", mux)
