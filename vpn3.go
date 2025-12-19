@@ -22,14 +22,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const SEND_DELAY = 50 * time.Millisecond
+const SEND_DELAY = 30 * time.Millisecond
 
 var logger = log.New(os.Stdout, "", log.LstdFlags)
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
+type Stream struct {
+	target   net.Conn
+	closed   bool
+}
+
 type Session struct {
 	conn     *websocket.Conn
-	streams  map[uint16]net.Conn
+	streams  map[uint16]*Stream
 	mu       sync.RWMutex
 	writeMu  sync.Mutex
 	lastSend time.Time
@@ -53,6 +58,12 @@ func (s *Session) sendFrame(id uint16, data []byte) {
 	s.lastSend = time.Now()
 }
 
+func (s *Session) getStream(id uint16) *Stream {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.streams[id]
+}
+
 func handleVPN(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Auth") != "sung:123.456" {
 		http.Error(w, "Auth", 401)
@@ -61,7 +72,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 	conn, _ := upgrader.Upgrade(w, r, nil)
 	defer conn.Close()
 
-	s := &Session{conn: conn, streams: make(map[uint16]net.Conn), lastSend: time.Now()}
+	s := &Session{conn: conn, streams: make(map[uint16]*Stream), lastSend: time.Now()}
 	logger.Printf("[VPN] Conectado: %s", r.RemoteAddr)
 
 	for {
@@ -79,11 +90,10 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 
 		logger.Printf("[RECV] id=%d len=%d", id, length)
 
-		s.mu.RLock()
-		target := s.streams[id]
-		s.mu.RUnlock()
+		stream := s.getStream(id)
 
-		if target == nil && len(data) >= 4 {
+		if stream == nil && len(data) >= 4 {
+			// CONNECT
 			port := binary.BigEndian.Uint16(data[1:3])
 			hostLen := data[3]
 			host := string(data[4 : 4+hostLen])
@@ -91,50 +101,82 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 
 			target, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
 			if err != nil {
+				logger.Printf("[CONNECT] ERRO: %v", err)
 				s.sendFrame(id, []byte{0x01})
 				continue
 			}
 
+			stream = &Stream{target: target, closed: false}
 			s.mu.Lock()
-			s.streams[id] = target
+			s.streams[id] = stream
 			s.mu.Unlock()
+			
 			s.sendFrame(id, []byte{0x00})
+			logger.Printf("[CONNECT] OK id=%d", id)
 
-			go func(id uint16, t net.Conn) {
+			// Goroutine de leitura
+			go func(id uint16, st *Stream) {
 				buf := make([]byte, 300)
 				for {
-					n, err := t.Read(buf)
-					if err != nil {
+					if st.closed {
 						break
 					}
-					s.sendFrame(id, buf[:n])
+					st.target.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, err := st.target.Read(buf)
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							continue // Timeout é OK, continuar
+						}
+						logger.Printf("[READ] id=%d erro=%v", id, err)
+						break
+					}
+					if n > 0 {
+						logger.Printf("[READ] id=%d bytes=%d", id, n)
+						s.sendFrame(id, buf[:n])
+					}
 				}
-				s.sendFrame(id, []byte{})
-				s.mu.Lock()
-				delete(s.streams, id)
-				s.mu.Unlock()
-				t.Close()
-			}(id, target)
-		} else if target != nil {
+				if !st.closed {
+					s.sendFrame(id, []byte{})
+					st.closed = true
+				}
+				logger.Printf("[CLOSE] id=%d", id)
+			}(id, stream)
+
+		} else if stream != nil && !stream.closed {
 			if len(data) == 0 {
-				target.Close()
+				// FIN
+				logger.Printf("[FIN] id=%d", id)
+				stream.closed = true
+				stream.target.Close()
 				s.mu.Lock()
 				delete(s.streams, id)
 				s.mu.Unlock()
 			} else {
-				target.Write(data)
+				// DATA
+				n, err := stream.target.Write(data)
+				if err != nil {
+					logger.Printf("[WRITE] id=%d ERRO: %v", id, err)
+				} else {
+					logger.Printf("[WRITE] id=%d len=%d", id, n)
+				}
 			}
+		} else {
+			logger.Printf("[WARN] id=%d stream nil ou closed", id)
 		}
 	}
+
 	s.mu.Lock()
-	for _, t := range s.streams {
-		t.Close()
+	for id, st := range s.streams {
+		st.closed = true
+		st.target.Close()
+		logger.Printf("[CLEANUP] id=%d", id)
 	}
 	s.mu.Unlock()
+	logger.Printf("[VPN] Desconectado")
 }
 
 func main() {
-	fmt.Println("VPN v3.0 - Delay 50ms")
+	fmt.Println("VPN v3.1 - Fixed")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vpn", handleVPN)
 	go http.ListenAndServe(":80", mux)
