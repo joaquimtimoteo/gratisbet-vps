@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
@@ -22,6 +21,8 @@ import (
 	"time"
 	"github.com/gorilla/websocket"
 )
+
+const MAX_CHUNK = 300 // Fragmentar em 300 bytes
 
 var logger = log.New(os.Stdout, "", log.LstdFlags)
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -36,11 +37,37 @@ type Session struct {
 func (s *Session) sendFrame(id uint16, data []byte) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	frame := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint16(frame[0:2], id)
-	binary.BigEndian.PutUint16(frame[2:4], uint16(len(data)))
-	copy(frame[4:], data)
-	s.conn.WriteMessage(websocket.BinaryMessage, frame)
+	
+	// Fragmentar se necessário
+	for len(data) > 0 || len(data) == 0 {
+		chunk := data
+		if len(chunk) > MAX_CHUNK {
+			chunk = data[:MAX_CHUNK]
+		}
+		
+		frame := make([]byte, 4+len(chunk))
+		binary.BigEndian.PutUint16(frame[0:2], id)
+		binary.BigEndian.PutUint16(frame[2:4], uint16(len(chunk)))
+		copy(frame[4:], chunk)
+		
+		err := s.conn.WriteMessage(websocket.BinaryMessage, frame)
+		if err != nil {
+			logger.Printf("[SEND] Erro: %v", err)
+			return
+		}
+		
+		logger.Printf("[SEND] id=%d chunk=%d", id, len(chunk))
+		
+		// Pequeno delay entre chunks
+		if len(data) > MAX_CHUNK {
+			time.Sleep(10 * time.Millisecond)
+		}
+		
+		data = data[len(chunk):]
+		if len(data) == 0 {
+			break
+		}
+	}
 }
 
 func handleVPN(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +94,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 		length := binary.BigEndian.Uint16(msg[2:4])
 		data := msg[4 : 4+length]
 		
-		logger.Printf("[FRAME] id=%d len=%d", id, length)
+		logger.Printf("[RECV] id=%d len=%d", id, length)
 		
 		s.mu.RLock()
 		target := s.streams[id]
@@ -81,6 +108,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 			
 			target, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
 			if err != nil {
+				logger.Printf("[CONNECT] Erro: %v", err)
 				s.sendFrame(id, []byte{0x01})
 				continue
 			}
@@ -90,14 +118,16 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 			
 			s.sendFrame(id, []byte{0x00})
+			logger.Printf("[CONNECT] OK")
 			
 			go func(id uint16, t net.Conn) {
-				buf := make([]byte, 4096)
+				buf := make([]byte, MAX_CHUNK)
 				for {
 					n, err := t.Read(buf)
 					if err != nil {
 						break
 					}
+					logger.Printf("[READ] id=%d bytes=%d", id, n)
 					s.sendFrame(id, buf[:n])
 				}
 				s.sendFrame(id, []byte{})
@@ -105,6 +135,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 				delete(s.streams, id)
 				s.mu.Unlock()
 				t.Close()
+				logger.Printf("[CLOSE] id=%d", id)
 			}(id, target)
 		} else if target != nil {
 			if len(data) == 0 {
@@ -127,7 +158,7 @@ func handleVPN(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	fmt.Println("VPN v2.0")
+	fmt.Println("VPN v2.1 - Chunks 300 bytes")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vpn", handleVPN)
 	go http.ListenAndServe(":80", mux)
