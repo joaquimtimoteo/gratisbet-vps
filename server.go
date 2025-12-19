@@ -70,7 +70,6 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		logger.Printf("[SEARCH] Error: %v", err)
 		w.Write([]byte(fmt.Sprintf("OK|%s|0\nErro: %v", query, err)))
 		return
 	}
@@ -81,24 +80,20 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 	
 	logger.Printf("[SEARCH] Google: %d bytes", len(html))
 	
-	// Salvar HTML para debug
-	os.WriteFile("/tmp/google_debug.html", body, 0644)
-	logger.Printf("[DEBUG] HTML salvo em /tmp/google_debug.html")
+	// DEBUG: salvar HTML
+	os.WriteFile("/tmp/google.html", body, 0644)
+	logger.Printf("[DEBUG] Salvo /tmp/google.html")
 	
-	// Extrair resultados
 	results := extractResults(html)
 	
-	// Formatar
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("OK|%s|%d\n", query, len(results)))
-	
 	for i, r := range results {
 		if len(r) > 50 {
 			r = r[:47] + "..."
 		}
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, r))
 	}
-	
 	if len(results) == 0 {
 		sb.WriteString("Sem resultados.\n")
 	}
@@ -108,9 +103,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, query string) {
 		response = response[:420]
 	}
 	
-	logger.Printf("[SEARCH] Results: %d, Response: %d bytes", len(results), len(response))
-	
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	logger.Printf("[SEARCH] Results: %d, Size: %d", len(results), len(response))
 	w.Write([]byte(response))
 }
 
@@ -118,32 +111,28 @@ func extractResults(html string) []string {
 	var results []string
 	seen := make(map[string]bool)
 	
-	// Lista de padrões para tentar
 	patterns := []string{
-		`<h3[^>]*>([^<]{10,100})</h3>`,                    // h3 tags
-		`class="[^"]*LC20lb[^"]*"[^>]*>([^<]{10,100})<`,   // LC20lb class
-		`class="[^"]*DKV0Md[^"]*"[^>]*>([^<]{10,100})<`,   // DKV0Md class  
-		`class="[^"]*BNeawe[^"]*"[^>]*>([^<]{10,100})<`,   // BNeawe class
-		`<a[^>]*href="/url[^"]*"[^>]*>([^<]{10,80})</a>`,  // Links com /url
-		`data-ved="[^"]*"[^>]*>([^<]{15,80})</`,           // data-ved elements
-		`<span[^>]*>([A-Z][^<]{20,80})</span>`,            // Spans com texto
+		`<h3[^>]*>([^<]{10,100})</h3>`,
+		`class="[^"]*LC20lb[^"]*"[^>]*>([^<]{10,100})<`,
+		`class="[^"]*DKV0Md[^"]*"[^>]*>([^<]{10,100})<`,
+		`class="[^"]*BNeawe[^"]*"[^>]*>([^<]{10,100})<`,
+		`<a[^>]*href="/url[^"]*"[^>]*>([^<]{10,80})</a>`,
+		`<span[^>]*>([A-Z][^<]{20,80})</span>`,
 	}
 	
 	for _, pattern := range patterns {
 		if len(results) >= 5 {
 			break
 		}
-		
 		re := regexp.MustCompile(pattern)
 		matches := re.FindAllStringSubmatch(html, 20)
-		
 		for _, m := range matches {
 			if len(m) > 1 {
 				text := cleanText(m[1])
-				if isValidResult(text) && !seen[text] {
+				if isValid(text) && !seen[text] {
 					seen[text] = true
 					results = append(results, text)
-					logger.Printf("[MATCH] Pattern '%s' found: %s", pattern[:20], text[:min(30, len(text))])
+					logger.Printf("[MATCH] %s", text[:min(40, len(text))])
 				}
 			}
 			if len(results) >= 5 {
@@ -152,17 +141,12 @@ func extractResults(html string) []string {
 		}
 	}
 	
-	// Se ainda não encontrou, tentar extração mais agressiva
 	if len(results) == 0 {
-		logger.Printf("[WARN] Nenhum padrão funcionou, tentando extração agressiva")
-		
-		// Procurar qualquer texto que pareça título
-		re := regexp.MustCompile(`>([A-Z][a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ\s\-]{15,70})<`)
+		re := regexp.MustCompile(`>([A-Z][a-zA-Z\s]{15,70})<`)
 		matches := re.FindAllStringSubmatch(html, 100)
-		
 		for _, m := range matches {
 			text := cleanText(m[1])
-			if isValidResult(text) && !seen[text] {
+			if isValid(text) && !seen[text] {
 				seen[text] = true
 				results = append(results, text)
 			}
@@ -179,22 +163,17 @@ func cleanText(s string) string {
 	s = strings.ReplaceAll(s, "&amp;", "&")
 	s = strings.ReplaceAll(s, "&quot;", "\"")
 	s = strings.ReplaceAll(s, "&#39;", "'")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
-	s = strings.TrimSpace(s)
-	s = strings.Join(strings.Fields(s), " ")
-	return s
+	return strings.TrimSpace(s)
 }
 
-func isValidResult(s string) bool {
+func isValid(s string) bool {
 	if len(s) < 10 || len(s) > 100 {
 		return false
 	}
-	// Filtrar lixo
-	invalid := []string{"{", "}", "function", "var ", "const ", "let ", "return", "window.", "document.", "http", "www", "google", "Pesquisar", "Fazer login"}
-	for _, inv := range invalid {
-		if strings.Contains(strings.ToLower(s), strings.ToLower(inv)) {
+	bad := []string{"{", "function", "var ", "window", "document", "google", "Pesquisar", "login"}
+	for _, b := range bad {
+		if strings.Contains(strings.ToLower(s), b) {
 			return false
 		}
 	}
@@ -209,32 +188,24 @@ func min(a, b int) int {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
 	query := r.URL.Query()
+	logger.Printf("[%s] %s", r.RemoteAddr, r.URL.String())
 	
-	logger.Printf("[%s] %s %s", r.RemoteAddr, r.Method, r.URL.String())
-	
-	reqUser := query.Get("user")
-	reqPass := query.Get("password")
-	
-	if reqUser != user || reqPass != password {
-		if path != "/status" && path != "/" {
+	if query.Get("user") != user || query.Get("password") != password {
+		if r.URL.Path != "/" {
 			http.Error(w, "Auth", 403)
 			return
 		}
 	}
 	
-	switch path {
-	case "/search":
+	if r.URL.Path == "/search" {
 		q := query.Get("q")
-		if q == "" {
-			w.Write([]byte("OK||0\nVazia"))
+		if q != "" {
+			handleSearch(w, r, q)
 			return
 		}
-		handleSearch(w, r, q)
-	default:
-		w.Write([]byte(`{"ok":true,"v":"6.4"}`))
 	}
+	w.Write([]byte(`{"v":"6.4"}`))
 }
 
 func main() {
@@ -251,7 +222,6 @@ func main() {
 		Handler: http.HandlerFunc(handleRequest),
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
 		},
 	}
 
@@ -261,7 +231,6 @@ func main() {
 	}()
 
 	logger.Println("[OK]")
-	
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
