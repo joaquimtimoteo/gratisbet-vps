@@ -640,8 +640,63 @@ func handleConnection(conn net.Conn) {
 	default:
 		// Responder 200 OK e iniciar bridge
 		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-		handleSSHBridge(conn, false)
+		
+		// IMPORTANTE: Passar o reader que pode ter dados buffered
+		handleSSHBridgeWithReader(conn, reader)
 	}
+}
+
+// SSH Bridge com reader buffered
+func handleSSHBridgeWithReader(conn net.Conn, reader *bufio.Reader) {
+	atomic.AddInt64(&metrics.SSHConns, 1)
+	atomic.AddInt64(&metrics.ActiveConns, 1)
+	defer atomic.AddInt64(&metrics.ActiveConns, -1)
+
+	logger.Printf("[SSH] Bridge iniciando (buffered)")
+
+	// Conectar ao SSH local
+	ssh, err := net.DialTimeout("tcp", "127.0.0.1:22", 10*time.Second)
+	if err != nil {
+		logger.Printf("[SSH] Conexão local falhou: %v", err)
+		return
+	}
+	defer ssh.Close()
+
+	logger.Printf("[SSH] Bridge estabelecida")
+
+	// Timeout para conexão SSH
+	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+	ssh.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	done := make(chan struct{}, 2)
+
+	// Cliente -> SSH (usando o reader buffered!)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		
+		// Primeiro, enviar qualquer dado que já esteja no buffer
+		buffered := reader.Buffered()
+		if buffered > 0 {
+			data := make([]byte, buffered)
+			reader.Read(data)
+			ssh.Write(data)
+			logger.Printf("[SSH] Enviou %d bytes buffered para SSH", buffered)
+		}
+		
+		// Depois, copiar o resto
+		n, _ := io.Copy(ssh, reader)
+		logger.Printf("[SSH] Cliente->SSH: %d bytes", n)
+	}()
+
+	// SSH -> Cliente
+	go func() {
+		defer func() { done <- struct{}{} }()
+		n, _ := io.Copy(conn, ssh)
+		logger.Printf("[SSH] SSH->Cliente: %d bytes", n)
+	}()
+
+	<-done
+	logger.Printf("[SSH] Bridge encerrada")
 }
 
 func handleHTTPRoute(conn net.Conn, method, path string, headers map[string]string, route string) {
