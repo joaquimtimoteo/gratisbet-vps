@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +30,7 @@ var lastBaseMu sync.RWMutex
 
 func main() {
 	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET PROXY v3.0")
+	fmt.Println("  GRATISBET PROXY v4.0")
 	fmt.Println("══════════════════════════════════════")
 
 	ln, _ := net.Listen("tcp", ":80")
@@ -81,6 +81,7 @@ func handle(conn net.Conn) {
 		return
 	}
 
+	// Recursos com base guardada
 	if isResource(path) {
 		lastBaseMu.RLock()
 		base := lastBase[remoteIP]
@@ -88,7 +89,7 @@ func handle(conn net.Conn) {
 		
 		if base != "" {
 			fullURL := base + path
-			fmt.Printf("[RESOURCE] %s\n", fullURL)
+			fmt.Printf("[RES] %s\n", fullURL)
 			doProxyURL(conn, fullURL, remoteIP)
 			return
 		}
@@ -98,13 +99,13 @@ func handle(conn net.Conn) {
 }
 
 func isResource(path string) bool {
-	exts := []string{".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".json"}
+	exts := []string{".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".json", ".map"}
 	for _, ext := range exts {
 		if strings.Contains(strings.ToLower(path), ext) {
 			return true
 		}
 	}
-	prefixes := []string{"/assets/", "/static/", "/css/", "/js/", "/fonts/", "/images/", "/img/", "/api/", "/_next/"}
+	prefixes := []string{"/assets/", "/static/", "/css/", "/js/", "/fonts/", "/images/", "/img/", "/api/", "/_next/", "/favicon"}
 	for _, p := range prefixes {
 		if strings.HasPrefix(path, p) {
 			return true
@@ -126,41 +127,29 @@ func doProxy(conn net.Conn, path string, remoteIP string) {
 func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	fmt.Printf("[PROXY] %s\n", targetURL)
 
-	if parsed, err := url.Parse(targetURL); err == nil {
-		base := parsed.Scheme + "://" + parsed.Host
-		lastBaseMu.Lock()
-		lastBase[remoteIP] = base
-		lastBaseMu.Unlock()
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		send(conn, 400, "text/plain", []byte("Invalid URL"))
+		return
 	}
+	
+	base := parsed.Scheme + "://" + parsed.Host
+	lastBaseMu.Lock()
+	lastBase[remoteIP] = base
+	lastBaseMu.Unlock()
 
 	req, _ := http.NewRequest("GET", targetURL, nil)
-	
-	// Headers para parecer browser real
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9,en;q=0.8")
 	req.Header.Set("Accept-Encoding", "gzip")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	
-	// Referer do mesmo domínio
-	if parsed, err := url.Parse(targetURL); err == nil {
-		req.Header.Set("Referer", parsed.Scheme+"://"+parsed.Host+"/")
-		req.Header.Set("Origin", parsed.Scheme+"://"+parsed.Host)
-	}
+	req.Header.Set("Referer", base+"/")
+	req.Header.Set("Origin", base)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("[ERROR] %v\n", err)
-		send(conn, 502, "text/plain", []byte("Error: "+err.Error()))
+		fmt.Printf("[ERR] %v\n", err)
+		send(conn, 502, "text/plain", []byte("Error"))
 		return
 	}
 	defer resp.Body.Close()
@@ -180,23 +169,68 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 
 	ct := resp.Header.Get("Content-Type")
 	
+	// Reescrever HTML para usar proxy em TODOS os URLs
 	if strings.Contains(ct, "text/html") {
-		body = rewriteHTML(body, targetURL)
+		body = rewriteHTML(body, base)
+	}
+	
+	// Reescrever CSS para URLs de fonts/images
+	if strings.Contains(ct, "text/css") {
+		body = rewriteCSS(body, base)
 	}
 
 	fmt.Printf("[SENT] %d bytes (status %d)\n", len(body), resp.StatusCode)
 	send(conn, resp.StatusCode, ct, body)
 }
 
-func rewriteHTML(body []byte, baseURL string) []byte {
-	base, _ := url.Parse(baseURL)
-	host := base.Scheme + "://" + base.Host
+func rewriteHTML(body []byte, base string) []byte {
 	html := string(body)
+	encodedBase := url.QueryEscape(base)
 
-	html = strings.ReplaceAll(html, `href="`+host, `href="/proxy?url=`+url.QueryEscape(host))
-	html = strings.ReplaceAll(html, `src="`+host, `src="/proxy?url=`+url.QueryEscape(host))
+	// Converter URLs absolutas HTTPS para proxy
+	// src="https://... -> src="/proxy?url=https%3A...
+	// href="https://... -> href="/proxy?url=https%3A...
+	
+	re1 := regexp.MustCompile(`(src|href)="(https?://[^"]+)"`)
+	html = re1.ReplaceAllStringFunc(html, func(match string) string {
+		parts := re1.FindStringSubmatch(match)
+		if len(parts) == 3 {
+			attr := parts[1]
+			urlStr := parts[2]
+			// Ignorar tracking pixels, analytics
+			if strings.Contains(urlStr, "facebook.com") || 
+			   strings.Contains(urlStr, "google") ||
+			   strings.Contains(urlStr, "analytics") ||
+			   strings.Contains(urlStr, "gtm") {
+				return fmt.Sprintf(`%s=""`, attr) // Remover
+			}
+			return fmt.Sprintf(`%s="/proxy?url=%s"`, attr, url.QueryEscape(urlStr))
+		}
+		return match
+	})
+
+	// Converter URLs relativas para absolutas via proxy
+	// src="/path -> src="/proxy?url=BASE/path
+	// href="/path -> href="/proxy?url=BASE/path
+	html = strings.ReplaceAll(html, `src="/`, `src="/proxy?url=`+encodedBase+`%2F`)
+	html = strings.ReplaceAll(html, `href="/`, `href="/proxy?url=`+encodedBase+`%2F`)
+	
+	// Remover scripts de tracking
+	html = regexp.MustCompile(`<script[^>]*facebook[^>]*>.*?</script>`).ReplaceAllString(html, "")
+	html = regexp.MustCompile(`<script[^>]*gtm[^>]*>.*?</script>`).ReplaceAllString(html, "")
 
 	return []byte(html)
+}
+
+func rewriteCSS(body []byte, base string) []byte {
+	css := string(body)
+	encodedBase := url.QueryEscape(base)
+	
+	// url(/path) -> url(/proxy?url=BASE/path)
+	re := regexp.MustCompile(`url\(['"]?(/[^'")]+)['"]?\)`)
+	css = re.ReplaceAllString(css, `url(/proxy?url=`+encodedBase+`$1)`)
+	
+	return []byte(css)
 }
 
 func sendHome(conn net.Conn) {
@@ -208,26 +242,25 @@ func sendHome(conn net.Conn) {
 body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;min-height:100vh}
 h1{color:#00c853;text-align:center;margin:20px 0;font-size:28px}
 p{text-align:center;color:#888;margin-bottom:20px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:15px;max-width:400px;margin:0 auto}
-.card{background:#2d2d44;border-radius:15px;padding:25px;text-align:center;text-decoration:none;color:#fff;transition:transform 0.2s}
+.card{background:#2d2d44;border-radius:15px;padding:30px;text-align:center;text-decoration:none;color:#fff;display:block;margin:20px auto;max-width:300px}
 .card:active{transform:scale(0.95)}
-.icon{font-size:50px;margin-bottom:10px}
-.name{font-weight:bold;font-size:16px}
+.icon{font-size:60px;margin-bottom:15px}
+.name{font-weight:bold;font-size:20px}
+.sub{color:#888;font-size:14px;margin-top:5px}
 </style></head><body>
 <h1>🎰 GratisBet</h1>
-<p>Apostas Grátis em Angola</p>
-<div class="grid">
-<a href="/proxy?url=https%3A%2F%2Fwww.elephantbet.co.ao%2F" class="card"><div class="icon">🐘</div><div class="name">ElephantBet</div></a>
-<a href="/proxy?url=https%3A%2F%2Fwww.premierbet.co.ao%2F" class="card"><div class="icon">👑</div><div class="name">PremierBet</div></a>
-<a href="/proxy?url=http%3A%2F%2Fbantubet.co.ao%2F" class="card"><div class="icon">⚽</div><div class="name">BantuBet</div></a>
-<a href="/proxy?url=https%3A%2F%2Fwww.kwanzabet.ao%2F" class="card"><div class="icon">💰</div><div class="name">KwanzaBet</div></a>
-</div>
+<p>Internet Grátis em Angola</p>
+<a href="/proxy?url=https%3A%2F%2Fwww.premierbet.co.ao%2F" class="card">
+<div class="icon">👑</div>
+<div class="name">PremierBet</div>
+<div class="sub">Toque para abrir</div>
+</a>
 </body></html>`
 	send(conn, 200, "text/html; charset=utf-8", []byte(html))
 }
 
 func send(conn net.Conn, code int, ct string, body []byte) {
-	status := map[int]string{200: "OK", 304: "Not Modified", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}[code]
+	status := map[int]string{200: "OK", 304: "Not Modified", 400: "Bad Request", 404: "Not Found", 502: "Bad Gateway"}[code]
 	if status == "" {
 		status = "OK"
 	}
