@@ -7,11 +7,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
-
-const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
 
 func main() {
 	client := &http.Client{
@@ -48,25 +45,11 @@ func main() {
 			return
 		}
 
-		// Detectar API Football
-		if strings.Contains(decoded, "api-sports.io") {
-			req.Header.Set("x-rapidapi-key", FOOTBALL_API_KEY)
-			req.Header.Set("x-rapidapi-host", "v3.football.api-sports.io")
-			req.Header.Set("Accept", "application/json")
-			log.Printf("[API-FOOTBALL] Com API key")
-		} else {
-			// Headers normais para sites
-			parsedURL, _ := url.Parse(decoded)
-			host := parsedURL.Host
-			
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-			req.Header.Set("Accept", "*/*")
-			req.Header.Set("Accept-Language", "pt-AO,pt;q=0.9,en;q=0.8")
-			req.Header.Set("Accept-Encoding", "identity")
-			req.Header.Set("Connection", "keep-alive")
-			req.Header.Set("Origin", fmt.Sprintf("https://%s", host))
-			req.Header.Set("Referer", fmt.Sprintf("https://%s/", host))
-		}
+		// Headers de browser
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Language", "pt-AO,pt;q=0.9,en;q=0.8")
+		req.Header.Set("Accept-Encoding", "identity")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -84,7 +67,7 @@ func main() {
 
 		log.Printf("[SENT] %d bytes (status %d)", len(body), resp.StatusCode)
 
-		// Copiar Content-Type original
+		// Copiar Content-Type
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}
@@ -99,7 +82,7 @@ func main() {
 	})
 
 	log.Println("=================================")
-	log.Println("  GratisBet Proxy + Football")
+	log.Println("  GratisBet Proxy Server")
 	log.Println("  Port: 80")
 	log.Println("=================================")
 
