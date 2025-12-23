@@ -16,8 +16,9 @@ import (
 	"time"
 )
 
-// API Football
+
 const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
+const YOUTUBE_API_KEY = "AIzaSyCxFo3x8k0BCQEEfNQLFS-6HWux4--0sjY"
 
 var jar, _ = cookiejar.New(nil)
 var client = &http.Client{
@@ -33,8 +34,8 @@ var lastBaseMu sync.RWMutex
 
 func main() {
 	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET PROXY v5.0")
-	fmt.Println("  + Football API")
+	fmt.Println("  GRATISBET PROXY v6.0")
+	fmt.Println("  + Football API + YouTube API")
 	fmt.Println("══════════════════════════════════════")
 
 	ln, _ := net.Listen("tcp", ":80")
@@ -147,6 +148,9 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	// Detectar API Football
 	isFootballAPI := strings.Contains(targetURL, "api-sports.io") || strings.Contains(targetURL, "api-football")
 	
+	// Detectar YouTube API
+	isYouTubeAPI := strings.Contains(targetURL, "googleapis.com/youtube")
+	
 	if isFootballAPI {
 		// Headers para API Football
 		req.Header.Set("x-rapidapi-key", FOOTBALL_API_KEY)
@@ -154,6 +158,19 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "GratisBet/1.0")
 		fmt.Printf("[API-FOOTBALL] Com API key\n")
+	} else if isYouTubeAPI {
+		// YouTube API - adicionar key se não tiver
+		if !strings.Contains(targetURL, "key=") {
+			if strings.Contains(targetURL, "?") {
+				targetURL = targetURL + "&key=" + YOUTUBE_API_KEY
+			} else {
+				targetURL = targetURL + "?key=" + YOUTUBE_API_KEY
+			}
+			req, _ = http.NewRequest("GET", targetURL, nil)
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "GratisBet/1.0")
+		fmt.Printf("[YOUTUBE-API] Request\n")
 	} else {
 		// Headers normais de browser
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
@@ -187,8 +204,8 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 
 	ct := resp.Header.Get("Content-Type")
 	
-	// Reescrever HTML para usar proxy em TODOS os URLs (não para API)
-	if strings.Contains(ct, "text/html") && !isFootballAPI {
+	// Reescrever HTML para usar proxy em TODOS os URLs (não para APIs)
+	if strings.Contains(ct, "text/html") && !isFootballAPI && !isYouTubeAPI {
 		body = rewriteHTML(body, base)
 	}
 	
