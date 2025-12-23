@@ -16,6 +16,9 @@ import (
 	"time"
 )
 
+// API Football
+const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
+
 var jar, _ = cookiejar.New(nil)
 var client = &http.Client{
 	Timeout: 30 * time.Second,
@@ -30,7 +33,8 @@ var lastBaseMu sync.RWMutex
 
 func main() {
 	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET PROXY v4.0")
+	fmt.Println("  GRATISBET PROXY v5.0")
+	fmt.Println("  + Football API")
 	fmt.Println("══════════════════════════════════════")
 
 	ln, _ := net.Listen("tcp", ":80")
@@ -139,12 +143,26 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	lastBaseMu.Unlock()
 
 	req, _ := http.NewRequest("GET", targetURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9,en;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip")
-	req.Header.Set("Referer", base+"/")
-	req.Header.Set("Origin", base)
+	
+	// Detectar API Football
+	isFootballAPI := strings.Contains(targetURL, "api-sports.io") || strings.Contains(targetURL, "api-football")
+	
+	if isFootballAPI {
+		// Headers para API Football
+		req.Header.Set("x-rapidapi-key", FOOTBALL_API_KEY)
+		req.Header.Set("x-rapidapi-host", "v3.football.api-sports.io")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "GratisBet/1.0")
+		fmt.Printf("[API-FOOTBALL] Com API key\n")
+	} else {
+		// Headers normais de browser
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9,en;q=0.8")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Referer", base+"/")
+		req.Header.Set("Origin", base)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -169,8 +187,8 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 
 	ct := resp.Header.Get("Content-Type")
 	
-	// Reescrever HTML para usar proxy em TODOS os URLs
-	if strings.Contains(ct, "text/html") {
+	// Reescrever HTML para usar proxy em TODOS os URLs (não para API)
+	if strings.Contains(ct, "text/html") && !isFootballAPI {
 		body = rewriteHTML(body, base)
 	}
 	
@@ -188,9 +206,6 @@ func rewriteHTML(body []byte, base string) []byte {
 	encodedBase := url.QueryEscape(base)
 
 	// Converter URLs absolutas HTTPS para proxy
-	// src="https://... -> src="/proxy?url=https%3A...
-	// href="https://... -> href="/proxy?url=https%3A...
-	
 	re1 := regexp.MustCompile(`(src|href)="(https?://[^"]+)"`)
 	html = re1.ReplaceAllStringFunc(html, func(match string) string {
 		parts := re1.FindStringSubmatch(match)
@@ -202,7 +217,7 @@ func rewriteHTML(body []byte, base string) []byte {
 			   strings.Contains(urlStr, "google") ||
 			   strings.Contains(urlStr, "analytics") ||
 			   strings.Contains(urlStr, "gtm") {
-				return fmt.Sprintf(`%s=""`, attr) // Remover
+				return fmt.Sprintf(`%s=""`, attr)
 			}
 			return fmt.Sprintf(`%s="/proxy?url=%s"`, attr, url.QueryEscape(urlStr))
 		}
@@ -210,8 +225,6 @@ func rewriteHTML(body []byte, base string) []byte {
 	})
 
 	// Converter URLs relativas para absolutas via proxy
-	// src="/path -> src="/proxy?url=BASE/path
-	// href="/path -> href="/proxy?url=BASE/path
 	html = strings.ReplaceAll(html, `src="/`, `src="/proxy?url=`+encodedBase+`%2F`)
 	html = strings.ReplaceAll(html, `href="/`, `href="/proxy?url=`+encodedBase+`%2F`)
 	
@@ -226,7 +239,6 @@ func rewriteCSS(body []byte, base string) []byte {
 	css := string(body)
 	encodedBase := url.QueryEscape(base)
 	
-	// url(/path) -> url(/proxy?url=BASE/path)
 	re := regexp.MustCompile(`url\(['"]?(/[^'")]+)['"]?\)`)
 	css = re.ReplaceAllString(css, `url(/proxy?url=`+encodedBase+`$1)`)
 	
