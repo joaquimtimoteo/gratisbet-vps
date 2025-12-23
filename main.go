@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-// API Football Key
 const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
 
 func main() {
@@ -26,7 +25,7 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "GratisBet Proxy + Football API")
+		fmt.Fprintf(w, "GratisBet Proxy OK")
 	})
 
 	http.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
@@ -49,34 +48,24 @@ func main() {
 			return
 		}
 
-		parsedURL, _ := url.Parse(decoded)
-		host := parsedURL.Host
-
-		// Detectar se é API Football
-		isFootballAPI := strings.Contains(decoded, "api-sports.io") || strings.Contains(decoded, "api-football")
-
-		if isFootballAPI {
-			// Headers específicos para API Football
+		// Detectar API Football
+		if strings.Contains(decoded, "api-sports.io") {
 			req.Header.Set("x-rapidapi-key", FOOTBALL_API_KEY)
 			req.Header.Set("x-rapidapi-host", "v3.football.api-sports.io")
 			req.Header.Set("Accept", "application/json")
-			req.Header.Set("User-Agent", "GratisBet/1.0")
-			log.Printf("[API-FOOTBALL] Request com API key")
+			log.Printf("[API-FOOTBALL] Com API key")
 		} else {
-			// Headers de browser para sites normais
+			// Headers normais para sites
+			parsedURL, _ := url.Parse(decoded)
+			host := parsedURL.Host
+			
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
-			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+			req.Header.Set("Accept", "*/*")
 			req.Header.Set("Accept-Language", "pt-AO,pt;q=0.9,en;q=0.8")
 			req.Header.Set("Accept-Encoding", "identity")
 			req.Header.Set("Connection", "keep-alive")
 			req.Header.Set("Origin", fmt.Sprintf("https://%s", host))
 			req.Header.Set("Referer", fmt.Sprintf("https://%s/", host))
-
-			// Headers para APIs JSON
-			if strings.Contains(decoded, "/api/") || strings.Contains(decoded, "gateway") || strings.Contains(decoded, ".json") {
-				req.Header.Set("Accept", "application/json, text/plain, */*")
-				req.Header.Set("X-Requested-With", "XMLHttpRequest")
-			}
 		}
 
 		resp, err := client.Do(req)
@@ -95,14 +84,12 @@ func main() {
 
 		log.Printf("[SENT] %d bytes (status %d)", len(body), resp.StatusCode)
 
-		// Content-Type
+		// Copiar Content-Type original
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}
 
-		// CORS
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
 	})
