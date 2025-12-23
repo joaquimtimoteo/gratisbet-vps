@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-
+// API Keys
 const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
 const YOUTUBE_API_KEY = "AIzaSyCxFo3x8k0BCQEEfNQLFS-6HWux4--0sjY"
 
@@ -34,8 +34,8 @@ var lastBaseMu sync.RWMutex
 
 func main() {
 	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET PROXY v6.0")
-	fmt.Println("  + Football API + YouTube API")
+	fmt.Println("  GRATISBET PROXY v7.0")
+	fmt.Println("  + Football + YouTube + BeSoccer")
 	fmt.Println("══════════════════════════════════════")
 
 	ln, _ := net.Listen("tcp", ":80")
@@ -151,6 +151,9 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	// Detectar YouTube API
 	isYouTubeAPI := strings.Contains(targetURL, "googleapis.com/youtube")
 	
+	// Detectar BeSoccer
+	isBeSoccer := strings.Contains(targetURL, "besoccer.com")
+	
 	if isFootballAPI {
 		// Headers para API Football
 		req.Header.Set("x-rapidapi-key", FOOTBALL_API_KEY)
@@ -171,6 +174,21 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "GratisBet/1.0")
 		fmt.Printf("[YOUTUBE-API] Request\n")
+	} else if isBeSoccer {
+		// Headers específicos para BeSoccer
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Site", "none")
+		req.Header.Set("Sec-Fetch-User", "?1")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		req.Header.Set("Referer", "https://pt.besoccer.com/")
+		fmt.Printf("[BESOCCER] Request\n")
 	} else {
 		// Headers normais de browser
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
@@ -205,7 +223,7 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	ct := resp.Header.Get("Content-Type")
 	
 	// Reescrever HTML para usar proxy em TODOS os URLs (não para APIs)
-	if strings.Contains(ct, "text/html") && !isFootballAPI && !isYouTubeAPI {
+	if strings.Contains(ct, "text/html") && !isFootballAPI && !isYouTubeAPI && !isBeSoccer {
 		body = rewriteHTML(body, base)
 	}
 	
