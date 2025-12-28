@@ -242,7 +242,15 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 
 	fmt.Printf("[TUNNEL] %s -> %s (%d bytes)\n", remoteIP, dest, len(data))
 
-	// Conectar ao destino
+	// Verificar se é DNS (porta 53) - usar UDP
+	if strings.HasSuffix(dest, ":53") {
+		response := handleDNS(dest, data)
+		fmt.Printf("[TUNNEL-DNS] Resposta: %d bytes\n", len(response))
+		send(conn, 200, "application/octet-stream", response)
+		return
+	}
+
+	// Conectar ao destino via TCP
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		fmt.Printf("[TUNNEL] Erro ao conectar %s: %v\n", dest, err)
@@ -278,6 +286,46 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 
 	fmt.Printf("[TUNNEL] Resposta: %d bytes\n", len(response))
 	send(conn, 200, "application/octet-stream", response)
+}
+
+// handleDNS envia query DNS via UDP e retorna resposta
+func handleDNS(dest string, query []byte) []byte {
+	// Usar sempre 8.8.8.8 para DNS (ignorar IPs privados)
+	dnsServer := "8.8.8.8:53"
+	
+	// Se for IP privado, usar Google DNS
+	if strings.HasPrefix(dest, "10.") || strings.HasPrefix(dest, "192.168.") || strings.HasPrefix(dest, "172.") {
+		fmt.Printf("[DNS] Ignorando IP privado %s, usando %s\n", dest, dnsServer)
+	} else if dest != "8.8.8.8:53" && dest != "8.8.4.4:53" {
+		dnsServer = dest
+	}
+
+	// Conectar via UDP
+	udpConn, err := net.DialTimeout("udp", dnsServer, 5*time.Second)
+	if err != nil {
+		fmt.Printf("[DNS] Erro ao conectar %s: %v\n", dnsServer, err)
+		return []byte{}
+	}
+	defer udpConn.Close()
+
+	// Enviar query
+	udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = udpConn.Write(query)
+	if err != nil {
+		fmt.Printf("[DNS] Erro ao enviar: %v\n", err)
+		return []byte{}
+	}
+
+	// Ler resposta
+	udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response := make([]byte, 512)
+	n, err := udpConn.Read(response)
+	if err != nil {
+		fmt.Printf("[DNS] Erro ao ler: %v\n", err)
+		return []byte{}
+	}
+
+	return response[:n]
 }
 
 /*
