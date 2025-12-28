@@ -42,7 +42,7 @@ var vpnStats = struct {
 
 func main() {
 	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET VPN SERVER v1.0")
+	fmt.Println("  GRATISBET VPN SERVER v2.0")
 	fmt.Println("  Porta 80 - Proxy + VPN Tunnel")
 	fmt.Println("══════════════════════════════════════")
 
@@ -52,9 +52,10 @@ func main() {
 		return
 	}
 	fmt.Println("  ✓ Porta 80 ativa")
-	fmt.Println("  ✓ Proxy:   /proxy?url=...")
-	fmt.Println("  ✓ Túnel:   /tunnel")
-	fmt.Println("  ✓ Connect: /connect?dest=...")
+	fmt.Println("  ✓ Proxy:       /proxy?url=...")
+	fmt.Println("  ✓ Túnel:       /tunnel")
+	fmt.Println("  ✓ VPN Connect: /vpn-connect (X-Dest header)")
+	fmt.Println("  ✓ Connect:     /connect?dest=...")
 	fmt.Println("══════════════════════════════════════")
 
 	for {
@@ -111,9 +112,20 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	// ============ VPN CONNECT (GET - conexão persistente) ============
+	// ============ VPN CONNECT (GET - conexão persistente com X-Dest header) ============
+	if path == "/vpn-connect" || strings.HasPrefix(path, "/vpn-connect") {
+		dest := headers["x-dest"]
+		if dest == "" {
+			send(conn, 400, "text/plain", []byte("Missing X-Dest header"))
+			return
+		}
+		handleVpnConnect(conn, reader, dest, remoteIP)
+		return
+	}
+
+	// ============ CONNECT com query string ============
 	if strings.HasPrefix(path, "/connect") {
-		handleConnect(conn, reader, path, remoteIP)
+		handleConnect(conn, reader, path, headers, remoteIP)
 		return
 	}
 
@@ -167,7 +179,7 @@ POST /tunnel HTTP/1.1
 Host: saldo.unitel.ao
 Content-Length: <len>
 
-[4 bytes: tamanho do destino][destino string][dados]
+[2 ou 4 bytes: tamanho do destino][destino string][dados]
 
 RESPONSE:
 HTTP/1.1 200 OK
@@ -177,7 +189,7 @@ Content-Length: <len>
 */
 
 func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
-	if contentLength < 5 {
+	if contentLength < 3 {
 		send(conn, 400, "text/plain", []byte("Invalid tunnel request"))
 		return
 	}
@@ -191,20 +203,42 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	// Extrair destino (formato: [4 bytes len][destino][dados])
-	if len(body) < 4 {
-		send(conn, 400, "text/plain", []byte("Invalid format"))
+	// Detectar formato: 2 bytes ou 4 bytes para destLen
+	var destLen int
+	var dataOffset int
+
+	if len(body) >= 4 {
+		// Tentar 4 bytes primeiro (Big Endian)
+		destLen4 := int(binary.BigEndian.Uint32(body[:4]))
+		// Tentar 2 bytes
+		destLen2 := int(binary.BigEndian.Uint16(body[:2]))
+
+		// Heurística: se destLen4 é muito grande ou negativo, usar 2 bytes
+		if destLen4 > 0 && destLen4 < 256 && 4+destLen4 <= len(body) {
+			destLen = destLen4
+			dataOffset = 4
+		} else if destLen2 > 0 && destLen2 < 256 && 2+destLen2 <= len(body) {
+			destLen = destLen2
+			dataOffset = 2
+		} else {
+			send(conn, 400, "text/plain", []byte("Invalid destination length"))
+			return
+		}
+	} else if len(body) >= 2 {
+		destLen = int(binary.BigEndian.Uint16(body[:2]))
+		dataOffset = 2
+	} else {
+		send(conn, 400, "text/plain", []byte("Body too short"))
 		return
 	}
 
-	destLen := int(binary.BigEndian.Uint32(body[:4]))
-	if destLen <= 0 || destLen > 255 || 4+destLen > len(body) {
+	if destLen <= 0 || destLen > 255 || dataOffset+destLen > len(body) {
 		send(conn, 400, "text/plain", []byte("Invalid destination"))
 		return
 	}
 
-	dest := string(body[4 : 4+destLen])
-	data := body[4+destLen:]
+	dest := string(body[dataOffset : dataOffset+destLen])
+	data := body[dataOffset+destLen:]
 
 	fmt.Printf("[TUNNEL] %s -> %s (%d bytes)\n", remoteIP, dest, len(data))
 
@@ -247,7 +281,83 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 }
 
 /*
-Protocolo /connect (conexão persistente bidirecional):
+Protocolo /vpn-connect (conexão persistente com X-Dest header):
+
+REQUEST:
+GET /vpn-connect HTTP/1.1
+Host: saldo.unitel.ao
+X-Dest: host:port
+
+RESPONSE (sucesso):
+HTTP/1.1 200 Connection Established
+
+[conexão bidirecional mantida aberta]
+*/
+
+func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP string) {
+	fmt.Printf("[VPN-CONNECT] %s -> %s\n", remoteIP, dest)
+
+	// Conectar ao destino
+	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	if err != nil {
+		fmt.Printf("[VPN-CONNECT] Erro ao conectar: %v\n", err)
+		send(conn, 502, "text/plain", []byte("Connection failed: "+err.Error()))
+		return
+	}
+
+	// Enviar resposta de sucesso
+	response := "HTTP/1.1 200 Connection Established\r\n" +
+		"Connection: keep-alive\r\n" +
+		"X-VPN: GratisBet\r\n\r\n"
+	conn.Write([]byte(response))
+
+	// Atualizar estatísticas
+	vpnStats.Lock()
+	vpnStats.ActiveTunnels++
+	vpnStats.Unlock()
+
+	fmt.Printf("[VPN-CONNECT] ✓ Túnel ativo: %s <-> %s\n", remoteIP, dest)
+
+	// Bidirecional - copiar dados em ambas direções
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var bytesUp, bytesDown int64
+
+	// Cliente -> Destino
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(targetConn, reader)
+		bytesUp = n
+		if tc, ok := targetConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	// Destino -> Cliente
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(conn, targetConn)
+		bytesDown = n
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
+	targetConn.Close()
+
+	// Atualizar estatísticas
+	vpnStats.Lock()
+	vpnStats.ActiveTunnels--
+	vpnStats.TotalBytes += bytesUp + bytesDown
+	vpnStats.Unlock()
+
+	fmt.Printf("[VPN-CONNECT] ✗ Túnel fechado: %s (↑%d ↓%d bytes)\n", remoteIP, bytesUp, bytesDown)
+}
+
+/*
+Protocolo /connect (conexão persistente com query string):
 
 REQUEST:
 GET /connect?dest=host:port HTTP/1.1
@@ -259,22 +369,24 @@ HTTP/1.1 200 Connection Established
 [conexão bidirecional mantida aberta]
 */
 
-func handleConnect(conn net.Conn, reader *bufio.Reader, path string, remoteIP string) {
-	// Extrair destino da query string
-	idx := strings.Index(path, "dest=")
-	if idx < 0 {
-		send(conn, 400, "text/plain", []byte("Missing dest parameter"))
-		return
-	}
-	dest, _ := url.QueryUnescape(path[idx+5:])
+func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map[string]string, remoteIP string) {
+	// Primeiro tentar X-Dest header
+	dest := headers["x-dest"]
 
-	// Remover qualquer coisa depois do destino (ex: &outros=params)
-	if ampIdx := strings.Index(dest, "&"); ampIdx > 0 {
-		dest = dest[:ampIdx]
+	// Se não tiver header, extrair da query string
+	if dest == "" {
+		idx := strings.Index(path, "dest=")
+		if idx >= 0 {
+			dest, _ = url.QueryUnescape(path[idx+5:])
+			// Remover qualquer coisa depois do destino
+			if ampIdx := strings.Index(dest, "&"); ampIdx > 0 {
+				dest = dest[:ampIdx]
+			}
+		}
 	}
 
 	if dest == "" {
-		send(conn, 400, "text/plain", []byte("Empty destination"))
+		send(conn, 400, "text/plain", []byte("Missing dest parameter or X-Dest header"))
 		return
 	}
 
@@ -312,7 +424,6 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, remoteIP st
 		defer wg.Done()
 		n, _ := io.Copy(targetConn, reader)
 		bytesUp = n
-		// Fechar escrita no destino quando cliente terminar
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -323,7 +434,6 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, remoteIP st
 		defer wg.Done()
 		n, _ := io.Copy(conn, targetConn)
 		bytesDown = n
-		// Fechar escrita no cliente quando destino terminar
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -347,7 +457,7 @@ func sendVPNStatus(conn net.Conn) {
 	total := vpnStats.TotalBytes
 	vpnStats.RUnlock()
 
-	json := fmt.Sprintf(`{"status":"online","active_tunnels":%d,"total_bytes":%d,"version":"1.0"}`, active, total)
+	json := fmt.Sprintf(`{"status":"online","active_tunnels":%d,"total_bytes":%d,"version":"2.0"}`, active, total)
 	send(conn, 200, "application/json", []byte(json))
 }
 
@@ -541,7 +651,7 @@ p{text-align:center;color:#888;margin-bottom:20px}
 <div class="status">
 <p class="online">● Servidor Online</p>
 <p class="stat">Túneis ativos: %d</p>
-<p class="stat">Proxy + VPN Tunnel</p>
+<p class="stat">Proxy + VPN Tunnel v2.0</p>
 </div>
 <a href="/proxy?url=https%%3A%%2F%%2Fwww.premierbet.co.ao%%2F" class="card">
 <div class="icon">👑</div>
