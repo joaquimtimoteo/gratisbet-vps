@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,9 @@ import (
 // API Keys
 const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
 const YOUTUBE_API_KEY = "AIzaSyCxFo3x8k0BCQEEfNQLFS-6HWux4--0sjY"
+
+// Versão do servidor
+const SERVER_VERSION = "2.1"
 
 var jar, _ = cookiejar.New(nil)
 var client = &http.Client{
@@ -33,30 +38,193 @@ var client = &http.Client{
 var lastBase = make(map[string]string)
 var lastBaseMu sync.RWMutex
 
-// Estatísticas VPN
-var vpnStats = struct {
-	sync.RWMutex
+// ════════════════════════════════════════════════════════════════════
+//                    SISTEMA DE ESTATÍSTICAS
+// ════════════════════════════════════════════════════════════════════
+
+// Informação de cada usuário conectado
+type UserInfo struct {
+	IP            string
+	FirstSeen     time.Time
+	LastSeen      time.Time
 	ActiveTunnels int
-	TotalBytes    int64
-}{}
+	BytesIn       int64
+	BytesOut      int64
+	Requests      int64
+}
+
+// Estatísticas globais do servidor
+var serverStats = struct {
+	sync.RWMutex
+	StartTime      time.Time
+	ActiveTunnels  int
+	TotalTunnels   int64
+	TotalBytes     int64
+	TotalBytesIn   int64
+	TotalBytesOut  int64
+	TotalRequests  int64
+	TotalDNS       int64
+	Users          map[string]*UserInfo // IP -> UserInfo
+	PeakUsers      int
+	PeakTunnels    int
+}{
+	Users: make(map[string]*UserInfo),
+}
+
+// Registrar atividade de usuário
+func trackUser(ip string) {
+	serverStats.Lock()
+	defer serverStats.Unlock()
+
+	serverStats.TotalRequests++
+
+	if user, exists := serverStats.Users[ip]; exists {
+		user.LastSeen = time.Now()
+		user.Requests++
+	} else {
+		serverStats.Users[ip] = &UserInfo{
+			IP:        ip,
+			FirstSeen: time.Now(),
+			LastSeen:  time.Now(),
+			Requests:  1,
+		}
+		// Verificar pico de usuários
+		if len(serverStats.Users) > serverStats.PeakUsers {
+			serverStats.PeakUsers = len(serverStats.Users)
+		}
+	}
+}
+
+// Registrar início de túnel
+func trackTunnelStart(ip string) {
+	serverStats.Lock()
+	defer serverStats.Unlock()
+
+	serverStats.ActiveTunnels++
+	serverStats.TotalTunnels++
+
+	if serverStats.ActiveTunnels > serverStats.PeakTunnels {
+		serverStats.PeakTunnels = serverStats.ActiveTunnels
+	}
+
+	if user, exists := serverStats.Users[ip]; exists {
+		user.ActiveTunnels++
+	}
+}
+
+// Registrar fim de túnel
+func trackTunnelEnd(ip string, bytesIn, bytesOut int64) {
+	serverStats.Lock()
+	defer serverStats.Unlock()
+
+	serverStats.ActiveTunnels--
+	serverStats.TotalBytesIn += bytesIn
+	serverStats.TotalBytesOut += bytesOut
+	serverStats.TotalBytes += bytesIn + bytesOut
+
+	if user, exists := serverStats.Users[ip]; exists {
+		user.ActiveTunnels--
+		user.BytesIn += bytesIn
+		user.BytesOut += bytesOut
+		user.LastSeen = time.Now()
+	}
+}
+
+// Registrar DNS
+func trackDNS() {
+	serverStats.Lock()
+	serverStats.TotalDNS++
+	serverStats.Unlock()
+}
+
+// Limpar usuários inativos (mais de 30 minutos sem atividade)
+func cleanupInactiveUsers() {
+	for {
+		time.Sleep(5 * time.Minute)
+
+		serverStats.Lock()
+		cutoff := time.Now().Add(-30 * time.Minute)
+		for ip, user := range serverStats.Users {
+			if user.ActiveTunnels == 0 && user.LastSeen.Before(cutoff) {
+				delete(serverStats.Users, ip)
+			}
+		}
+		serverStats.Unlock()
+	}
+}
+
+// Contar usuários ativos (com túnel ou atividade nos últimos 5 min)
+func getActiveUsers() int {
+	serverStats.RLock()
+	defer serverStats.RUnlock()
+
+	cutoff := time.Now().Add(-5 * time.Minute)
+	count := 0
+	for _, user := range serverStats.Users {
+		if user.ActiveTunnels > 0 || user.LastSeen.After(cutoff) {
+			count++
+		}
+	}
+	return count
+}
+
+// Contar usuários online (com túnel ativo)
+func getOnlineUsers() int {
+	serverStats.RLock()
+	defer serverStats.RUnlock()
+
+	count := 0
+	for _, user := range serverStats.Users {
+		if user.ActiveTunnels > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+// ════════════════════════════════════════════════════════════════════
+//                         MAIN
+// ════════════════════════════════════════════════════════════════════
 
 func main() {
-	fmt.Println("══════════════════════════════════════")
-	fmt.Println("  GRATISBET VPN SERVER v2.0")
-	fmt.Println("  Porta 80 - Proxy + VPN Tunnel")
-	fmt.Println("══════════════════════════════════════")
+	serverStats.StartTime = time.Now()
+
+	fmt.Println("══════════════════════════════════════════════")
+	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
+	fmt.Println("  Porta 80 - Proxy + VPN Tunnel + Stats")
+	fmt.Println("══════════════════════════════════════════════")
 
 	ln, err := net.Listen("tcp", ":80")
 	if err != nil {
 		fmt.Printf("Erro ao iniciar servidor: %v\n", err)
 		return
 	}
+
 	fmt.Println("  ✓ Porta 80 ativa")
 	fmt.Println("  ✓ Proxy:       /proxy?url=...")
 	fmt.Println("  ✓ Túnel:       /tunnel")
-	fmt.Println("  ✓ VPN Connect: /vpn-connect (X-Dest header)")
-	fmt.Println("  ✓ Connect:     /connect?dest=...")
-	fmt.Println("══════════════════════════════════════")
+	fmt.Println("  ✓ VPN Connect: /vpn-connect")
+	fmt.Println("  ✓ Stats:       /stats")
+	fmt.Println("  ✓ Status:      /vpn-status")
+	fmt.Println("══════════════════════════════════════════════")
+
+	// Goroutine para limpar usuários inativos
+	go cleanupInactiveUsers()
+
+	// Goroutine para log periódico
+	go func() {
+		for {
+			time.Sleep(60 * time.Second)
+			online := getOnlineUsers()
+			active := getActiveUsers()
+			serverStats.RLock()
+			tunnels := serverStats.ActiveTunnels
+			totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
+			serverStats.RUnlock()
+			fmt.Printf("[STATS] Online: %d | Ativos: %d | Túneis: %d | Total: %.2f MB\n",
+				online, active, tunnels, totalMB)
+		}
+	}()
 
 	for {
 		conn, err := ln.Accept()
@@ -73,6 +241,9 @@ func handle(conn net.Conn) {
 
 	remote := conn.RemoteAddr().String()
 	remoteIP := strings.Split(remote, ":")[0]
+
+	// Registrar usuário
+	trackUser(remoteIP)
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -106,87 +277,158 @@ func handle(conn net.Conn) {
 
 	fmt.Printf("[%s] %s %s from %s\n", time.Now().Format("15:04:05"), method, path, remoteIP)
 
-	// ============ VPN TUNNEL (POST) ============
-	if path == "/tunnel" && method == "POST" {
-		handleTunnel(conn, reader, contentLength, remoteIP)
-		return
-	}
+	// ============ ROTAS ============
 
-	// ============ VPN CONNECT (GET - conexão persistente com X-Dest header) ============
-	if path == "/vpn-connect" || strings.HasPrefix(path, "/vpn-connect") {
+	switch {
+	case path == "/tunnel" && method == "POST":
+		handleTunnel(conn, reader, contentLength, remoteIP)
+
+	case path == "/vpn-connect" || strings.HasPrefix(path, "/vpn-connect"):
 		dest := headers["x-dest"]
 		if dest == "" {
 			send(conn, 400, "text/plain", []byte("Missing X-Dest header"))
 			return
 		}
 		handleVpnConnect(conn, reader, dest, remoteIP)
-		return
-	}
 
-	// ============ CONNECT com query string ============
-	if strings.HasPrefix(path, "/connect") {
+	case strings.HasPrefix(path, "/connect"):
 		handleConnect(conn, reader, path, headers, remoteIP)
-		return
-	}
 
-	// ============ STATUS ============
-	if path == "/vpn-status" {
+	case path == "/stats":
+		sendStats(conn)
+
+	case path == "/stats/users":
+		sendUserStats(conn)
+
+	case path == "/vpn-status":
 		sendVPNStatus(conn)
-		return
-	}
 
-	// ============ PROXY EXISTENTE ============
-	if path == "/" {
+	case path == "/":
 		sendHome(conn)
-		return
-	}
 
-	if path == "/ping" {
+	case path == "/ping":
 		send(conn, 200, "text/plain", []byte("OK"))
-		return
-	}
 
-	if strings.HasPrefix(path, "/proxy?url=") {
+	case strings.HasPrefix(path, "/proxy?url="):
 		doProxy(conn, path, remoteIP)
-		return
+
+	default:
+		if isResource(path) {
+			lastBaseMu.RLock()
+			base := lastBase[remoteIP]
+			lastBaseMu.RUnlock()
+
+			if base != "" {
+				fullURL := base + path
+				fmt.Printf("[RES] %s\n", fullURL)
+				doProxyURL(conn, fullURL, remoteIP)
+				return
+			}
+		}
+		send(conn, 404, "text/plain", []byte("Not Found"))
 	}
+}
 
-	if isResource(path) {
-		lastBaseMu.RLock()
-		base := lastBase[remoteIP]
-		lastBaseMu.RUnlock()
+// ════════════════════════════════════════════════════════════════════
+//                         ENDPOINTS DE ESTATÍSTICAS
+// ════════════════════════════════════════════════════════════════════
 
-		if base != "" {
-			fullURL := base + path
-			fmt.Printf("[RES] %s\n", fullURL)
-			doProxyURL(conn, fullURL, remoteIP)
-			return
+func sendStats(conn net.Conn) {
+	serverStats.RLock()
+	uptime := time.Since(serverStats.StartTime)
+	
+	onlineUsers := 0
+	activeUsers := 0
+	cutoff := time.Now().Add(-5 * time.Minute)
+	for _, user := range serverStats.Users {
+		if user.ActiveTunnels > 0 {
+			onlineUsers++
+		}
+		if user.ActiveTunnels > 0 || user.LastSeen.After(cutoff) {
+			activeUsers++
 		}
 	}
+	
+	stats := map[string]interface{}{
+		"status":  "online",
+		"version": SERVER_VERSION,
+		"uptime":  uptime.String(),
+		"uptime_seconds": int64(uptime.Seconds()),
+		"users": map[string]int{
+			"online":     onlineUsers,
+			"active":     activeUsers,
+			"total":      len(serverStats.Users),
+			"peak":       serverStats.PeakUsers,
+		},
+		"tunnels": map[string]interface{}{
+			"active": serverStats.ActiveTunnels,
+			"total":  serverStats.TotalTunnels,
+			"peak":   serverStats.PeakTunnels,
+		},
+		"traffic": map[string]interface{}{
+			"total_bytes":    serverStats.TotalBytes,
+			"total_mb":       float64(serverStats.TotalBytes) / 1024 / 1024,
+			"bytes_in":       serverStats.TotalBytesIn,
+			"bytes_out":      serverStats.TotalBytesOut,
+		},
+		"requests": map[string]int64{
+			"total": serverStats.TotalRequests,
+			"dns":   serverStats.TotalDNS,
+		},
+		"system": map[string]interface{}{
+			"goroutines": runtime.NumGoroutine(),
+			"cpus":       runtime.NumCPU(),
+		},
+	}
+	serverStats.RUnlock()
 
-	send(conn, 404, "text/plain", []byte("Not Found"))
+	jsonData, _ := json.MarshalIndent(stats, "", "  ")
+	send(conn, 200, "application/json", jsonData)
+}
+
+func sendUserStats(conn net.Conn) {
+	serverStats.RLock()
+	users := make([]map[string]interface{}, 0)
+
+	for _, user := range serverStats.Users {
+		users = append(users, map[string]interface{}{
+			"ip":             user.IP,
+			"active_tunnels": user.ActiveTunnels,
+			"bytes_in":       user.BytesIn,
+			"bytes_out":      user.BytesOut,
+			"requests":       user.Requests,
+			"first_seen":     user.FirstSeen.Format("15:04:05"),
+			"last_seen":      user.LastSeen.Format("15:04:05"),
+			"online":         user.ActiveTunnels > 0,
+		})
+	}
+	serverStats.RUnlock()
+
+	response := map[string]interface{}{
+		"total_users": len(users),
+		"users":       users,
+	}
+
+	jsonData, _ := json.MarshalIndent(response, "", "  ")
+	send(conn, 200, "application/json", jsonData)
+}
+
+func sendVPNStatus(conn net.Conn) {
+	serverStats.RLock()
+	active := serverStats.ActiveTunnels
+	total := serverStats.TotalBytes
+	serverStats.RUnlock()
+
+	online := getOnlineUsers()
+
+	json := fmt.Sprintf(`{"status":"online","version":"%s","online_users":%d,"active_tunnels":%d,"total_bytes":%d}`,
+		SERVER_VERSION, online, active, total)
+	send(conn, 200, "application/json", []byte(json))
 }
 
 // ════════════════════════════════════════════════════════════════════
 //                         VPN TUNNEL HANDLERS
 // ════════════════════════════════════════════════════════════════════
-
-/*
-Protocolo /tunnel (request-response):
-
-REQUEST:
-POST /tunnel HTTP/1.1
-Host: saldo.unitel.ao
-Content-Length: <len>
-
-[2 ou 4 bytes: tamanho do destino][destino string][dados]
-
-RESPONSE:
-HTTP/1.1 200 OK
-Content-Length: <len>
-
-[dados de resposta]
-*/
 
 func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
 	if contentLength < 3 {
@@ -194,7 +436,6 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	// Ler corpo da requisição
 	body := make([]byte, contentLength)
 	_, err := io.ReadFull(reader, body)
 	if err != nil {
@@ -203,17 +444,13 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	// Detectar formato: 2 bytes ou 4 bytes para destLen
 	var destLen int
 	var dataOffset int
 
 	if len(body) >= 4 {
-		// Tentar 4 bytes primeiro (Big Endian)
 		destLen4 := int(binary.BigEndian.Uint32(body[:4]))
-		// Tentar 2 bytes
 		destLen2 := int(binary.BigEndian.Uint16(body[:2]))
 
-		// Heurística: se destLen4 é muito grande ou negativo, usar 2 bytes
 		if destLen4 > 0 && destLen4 < 256 && 4+destLen4 <= len(body) {
 			destLen = destLen4
 			dataOffset = 4
@@ -242,15 +479,14 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 
 	fmt.Printf("[TUNNEL] %s -> %s (%d bytes)\n", remoteIP, dest, len(data))
 
-	// Verificar se é DNS (porta 53) - usar UDP
 	if strings.HasSuffix(dest, ":53") {
+		trackDNS()
 		response := handleDNS(dest, data)
 		fmt.Printf("[TUNNEL-DNS] Resposta: %d bytes\n", len(response))
 		send(conn, 200, "application/octet-stream", response)
 		return
 	}
 
-	// Conectar ao destino via TCP
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		fmt.Printf("[TUNNEL] Erro ao conectar %s: %v\n", dest, err)
@@ -259,7 +495,6 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 	}
 	defer targetConn.Close()
 
-	// Enviar dados
 	if len(data) > 0 {
 		targetConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		_, err = targetConn.Write(data)
@@ -270,7 +505,6 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		}
 	}
 
-	// Ler resposta
 	targetConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	response, err := io.ReadAll(targetConn)
 	if err != nil && len(response) == 0 {
@@ -279,28 +513,23 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	// Atualizar estatísticas
-	vpnStats.Lock()
-	vpnStats.TotalBytes += int64(len(data) + len(response))
-	vpnStats.Unlock()
+	// Registrar tráfego
+	trackTunnelStart(remoteIP)
+	trackTunnelEnd(remoteIP, int64(len(data)), int64(len(response)))
 
 	fmt.Printf("[TUNNEL] Resposta: %d bytes\n", len(response))
 	send(conn, 200, "application/octet-stream", response)
 }
 
-// handleDNS envia query DNS via UDP e retorna resposta
 func handleDNS(dest string, query []byte) []byte {
-	// Usar sempre 8.8.8.8 para DNS (ignorar IPs privados)
 	dnsServer := "8.8.8.8:53"
-	
-	// Se for IP privado, usar Google DNS
+
 	if strings.HasPrefix(dest, "10.") || strings.HasPrefix(dest, "192.168.") || strings.HasPrefix(dest, "172.") {
 		fmt.Printf("[DNS] Ignorando IP privado %s, usando %s\n", dest, dnsServer)
 	} else if dest != "8.8.8.8:53" && dest != "8.8.4.4:53" {
 		dnsServer = dest
 	}
 
-	// Conectar via UDP
 	udpConn, err := net.DialTimeout("udp", dnsServer, 5*time.Second)
 	if err != nil {
 		fmt.Printf("[DNS] Erro ao conectar %s: %v\n", dnsServer, err)
@@ -308,7 +537,6 @@ func handleDNS(dest string, query []byte) []byte {
 	}
 	defer udpConn.Close()
 
-	// Enviar query
 	udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err = udpConn.Write(query)
 	if err != nil {
@@ -316,7 +544,6 @@ func handleDNS(dest string, query []byte) []byte {
 		return []byte{}
 	}
 
-	// Ler resposta
 	udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	response := make([]byte, 512)
 	n, err := udpConn.Read(response)
@@ -328,24 +555,9 @@ func handleDNS(dest string, query []byte) []byte {
 	return response[:n]
 }
 
-/*
-Protocolo /vpn-connect (conexão persistente com X-Dest header):
-
-REQUEST:
-GET /vpn-connect HTTP/1.1
-Host: saldo.unitel.ao
-X-Dest: host:port
-
-RESPONSE (sucesso):
-HTTP/1.1 200 Connection Established
-
-[conexão bidirecional mantida aberta]
-*/
-
 func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP string) {
 	fmt.Printf("[VPN-CONNECT] %s -> %s\n", remoteIP, dest)
 
-	// Conectar ao destino
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		fmt.Printf("[VPN-CONNECT] Erro ao conectar: %v\n", err)
@@ -353,26 +565,20 @@ func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP
 		return
 	}
 
-	// Enviar resposta de sucesso
 	response := "HTTP/1.1 200 Connection Established\r\n" +
 		"Connection: keep-alive\r\n" +
 		"X-VPN: GratisBet\r\n\r\n"
 	conn.Write([]byte(response))
 
-	// Atualizar estatísticas
-	vpnStats.Lock()
-	vpnStats.ActiveTunnels++
-	vpnStats.Unlock()
+	trackTunnelStart(remoteIP)
 
 	fmt.Printf("[VPN-CONNECT] ✓ Túnel ativo: %s <-> %s\n", remoteIP, dest)
 
-	// Bidirecional - copiar dados em ambas direções
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	var bytesUp, bytesDown int64
 
-	// Cliente -> Destino
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(targetConn, reader)
@@ -382,7 +588,6 @@ func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP
 		}
 	}()
 
-	// Destino -> Cliente
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(conn, targetConn)
@@ -395,38 +600,18 @@ func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP
 	wg.Wait()
 	targetConn.Close()
 
-	// Atualizar estatísticas
-	vpnStats.Lock()
-	vpnStats.ActiveTunnels--
-	vpnStats.TotalBytes += bytesUp + bytesDown
-	vpnStats.Unlock()
+	trackTunnelEnd(remoteIP, bytesDown, bytesUp)
 
 	fmt.Printf("[VPN-CONNECT] ✗ Túnel fechado: %s (↑%d ↓%d bytes)\n", remoteIP, bytesUp, bytesDown)
 }
 
-/*
-Protocolo /connect (conexão persistente com query string):
-
-REQUEST:
-GET /connect?dest=host:port HTTP/1.1
-Host: saldo.unitel.ao
-
-RESPONSE (sucesso):
-HTTP/1.1 200 Connection Established
-
-[conexão bidirecional mantida aberta]
-*/
-
 func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map[string]string, remoteIP string) {
-	// Primeiro tentar X-Dest header
 	dest := headers["x-dest"]
 
-	// Se não tiver header, extrair da query string
 	if dest == "" {
 		idx := strings.Index(path, "dest=")
 		if idx >= 0 {
 			dest, _ = url.QueryUnescape(path[idx+5:])
-			// Remover qualquer coisa depois do destino
 			if ampIdx := strings.Index(dest, "&"); ampIdx > 0 {
 				dest = dest[:ampIdx]
 			}
@@ -440,7 +625,6 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map
 
 	fmt.Printf("[CONNECT] %s -> %s\n", remoteIP, dest)
 
-	// Conectar ao destino
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		fmt.Printf("[CONNECT] Erro ao conectar: %v\n", err)
@@ -448,26 +632,20 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map
 		return
 	}
 
-	// Enviar resposta de sucesso
 	response := "HTTP/1.1 200 Connection Established\r\n" +
 		"Connection: keep-alive\r\n" +
 		"X-VPN: GratisBet\r\n\r\n"
 	conn.Write([]byte(response))
 
-	// Atualizar estatísticas
-	vpnStats.Lock()
-	vpnStats.ActiveTunnels++
-	vpnStats.Unlock()
+	trackTunnelStart(remoteIP)
 
 	fmt.Printf("[CONNECT] ✓ Túnel ativo: %s <-> %s\n", remoteIP, dest)
 
-	// Bidirecional - copiar dados em ambas direções
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	var bytesUp, bytesDown int64
 
-	// Cliente -> Destino
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(targetConn, reader)
@@ -477,7 +655,6 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map
 		}
 	}()
 
-	// Destino -> Cliente
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(conn, targetConn)
@@ -490,27 +667,13 @@ func handleConnect(conn net.Conn, reader *bufio.Reader, path string, headers map
 	wg.Wait()
 	targetConn.Close()
 
-	// Atualizar estatísticas
-	vpnStats.Lock()
-	vpnStats.ActiveTunnels--
-	vpnStats.TotalBytes += bytesUp + bytesDown
-	vpnStats.Unlock()
+	trackTunnelEnd(remoteIP, bytesDown, bytesUp)
 
 	fmt.Printf("[CONNECT] ✗ Túnel fechado: %s (↑%d ↓%d bytes)\n", remoteIP, bytesUp, bytesDown)
 }
 
-func sendVPNStatus(conn net.Conn) {
-	vpnStats.RLock()
-	active := vpnStats.ActiveTunnels
-	total := vpnStats.TotalBytes
-	vpnStats.RUnlock()
-
-	json := fmt.Sprintf(`{"status":"online","active_tunnels":%d,"total_bytes":%d,"version":"2.0"}`, active, total)
-	send(conn, 200, "application/json", []byte(json))
-}
-
 // ════════════════════════════════════════════════════════════════════
-//                         PROXY EXISTENTE
+//                         PROXY
 // ════════════════════════════════════════════════════════════════════
 
 func isResource(path string) bool {
@@ -673,9 +836,14 @@ func rewriteCSS(body []byte, base string) []byte {
 }
 
 func sendHome(conn net.Conn) {
-	vpnStats.RLock()
-	active := vpnStats.ActiveTunnels
-	vpnStats.RUnlock()
+	online := getOnlineUsers()
+	active := getActiveUsers()
+
+	serverStats.RLock()
+	tunnels := serverStats.ActiveTunnels
+	totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
+	uptime := time.Since(serverStats.StartTime)
+	serverStats.RUnlock()
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -685,29 +853,49 @@ func sendHome(conn net.Conn) {
 body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;min-height:100vh}
 h1{color:#00c853;text-align:center;margin:20px 0;font-size:28px}
 p{text-align:center;color:#888;margin-bottom:20px}
-.status{background:#2d2d44;border-radius:15px;padding:20px;text-align:center;margin:20px auto;max-width:300px}
-.online{color:#00c853;font-size:18px}
-.stat{color:#888;font-size:14px;margin-top:10px}
+.status{background:#2d2d44;border-radius:15px;padding:20px;text-align:center;margin:20px auto;max-width:350px}
+.online{color:#00c853;font-size:24px;margin-bottom:15px}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;text-align:left}
+.stat{background:#1a1a2e;padding:10px;border-radius:8px}
+.stat-label{color:#888;font-size:12px}
+.stat-value{color:#fff;font-size:18px;font-weight:bold}
 .card{background:#2d2d44;border-radius:15px;padding:30px;text-align:center;text-decoration:none;color:#fff;display:block;margin:20px auto;max-width:300px}
 .card:active{transform:scale(0.95)}
 .icon{font-size:60px;margin-bottom:15px}
 .name{font-weight:bold;font-size:20px}
 .sub{color:#888;font-size:14px;margin-top:5px}
+.version{color:#666;font-size:12px;text-align:center;margin-top:20px}
 </style></head><body>
 <h1>🛡️ GratisBet VPN</h1>
 <p>Internet Grátis em Angola</p>
 <div class="status">
-<p class="online">● Servidor Online</p>
-<p class="stat">Túneis ativos: %d</p>
-<p class="stat">Proxy + VPN Tunnel v2.0</p>
+<p class="online">● %d Usuários Online</p>
+<div class="stats-grid">
+<div class="stat"><div class="stat-label">Ativos (5min)</div><div class="stat-value">%d</div></div>
+<div class="stat"><div class="stat-label">Túneis</div><div class="stat-value">%d</div></div>
+<div class="stat"><div class="stat-label">Tráfego</div><div class="stat-value">%.1f MB</div></div>
+<div class="stat"><div class="stat-label">Uptime</div><div class="stat-value">%s</div></div>
+</div>
 </div>
 <a href="/proxy?url=https%%3A%%2F%%2Fwww.premierbet.co.ao%%2F" class="card">
 <div class="icon">👑</div>
 <div class="name">PremierBet</div>
 <div class="sub">Toque para abrir</div>
 </a>
-</body></html>`, active)
+<p class="version">GratisBet VPN Server v%s</p>
+</body></html>`, online, active, tunnels, totalMB, formatDuration(uptime), SERVER_VERSION)
 	send(conn, 200, "text/html; charset=utf-8", []byte(html))
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
 func send(conn net.Conn, code int, ct string, body []byte) {
