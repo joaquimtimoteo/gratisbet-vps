@@ -190,7 +190,7 @@ func main() {
 	serverStats.StartTime = time.Now()
 
 	fmt.Println("══════════════════════════════════════════════")
-	fmt.Println("  GRATISBET VPN SERVER version" + SERVER_VERSION)
+	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
 	fmt.Println("  Porta 80 - Proxy + VPN Tunnel + Stats")
 	fmt.Println("══════════════════════════════════════════════")
 
