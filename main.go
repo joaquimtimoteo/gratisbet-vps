@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/base64"
@@ -26,7 +25,7 @@ const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
 const YOUTUBE_API_KEY = "AIzaSyCxFo3x8k0BCQEEfNQLFS-6HWux4--0sjY"
 
 // Versão do servidor
-const SERVER_VERSION = "3.0-relay"
+const SERVER_VERSION = "3.1-persistent"
 
 // ════════════════════════════════════════════════════════════════════
 //                    POOL DE CONEXÕES PERSISTENTES
@@ -34,23 +33,26 @@ const SERVER_VERSION = "3.0-relay"
 
 // Conexão persistente com destino
 type PersistentConn struct {
-	conn      net.Conn
-	dest      string
-	createdAt time.Time
-	lastUsed  time.Time
-	mu        sync.Mutex
+	conn       net.Conn
+	dest       string
+	userIP     string
+	createdAt  time.Time
+	lastUsed   time.Time
+	mu         sync.Mutex
+	readBuffer []byte
+	closed     bool
 }
 
-// Pool de conexões por usuário
+// Pool de conexões: userIP -> dest -> *PersistentConn
 var connPool = struct {
 	sync.RWMutex
-	conns map[string]map[string]*PersistentConn // userIP -> dest -> conn
+	conns map[string]map[string]*PersistentConn
 }{
 	conns: make(map[string]map[string]*PersistentConn),
 }
 
 // Obter ou criar conexão persistente
-func getOrCreateConn(userIP, dest string) (*PersistentConn, error) {
+func getOrCreateConn(userIP, dest string) (*PersistentConn, bool, error) {
 	connPool.Lock()
 	defer connPool.Unlock()
 
@@ -60,41 +62,55 @@ func getOrCreateConn(userIP, dest string) (*PersistentConn, error) {
 
 	// Verificar se já existe conexão válida
 	if pc, exists := connPool.conns[userIP][dest]; exists {
-		// Verificar se ainda está ativa (menos de 30s)
-		if time.Since(pc.lastUsed) < 30*time.Second {
+		if !pc.closed && time.Since(pc.lastUsed) < 60*time.Second {
 			pc.lastUsed = time.Now()
-			return pc, nil
+			return pc, false, nil // false = não é nova
 		}
-		// Conexão expirada, fechar
-		pc.conn.Close()
+		// Conexão expirada ou fechada, limpar
+		if pc.conn != nil {
+			pc.conn.Close()
+		}
 		delete(connPool.conns[userIP], dest)
 	}
 
 	// Criar nova conexão
-	conn, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", dest, 15*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+
+	// Configurar TCP
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetNoDelay(true)
 	}
 
 	pc := &PersistentConn{
-		conn:      conn,
-		dest:      dest,
-		createdAt: time.Now(),
-		lastUsed:  time.Now(),
+		conn:       conn,
+		dest:       dest,
+		userIP:     userIP,
+		createdAt:  time.Now(),
+		lastUsed:   time.Now(),
+		readBuffer: make([]byte, 0),
+		closed:     false,
 	}
 
 	connPool.conns[userIP][dest] = pc
-	return pc, nil
+	return pc, true, nil // true = é nova conexão
 }
 
-// Fechar conexão
+// Fechar conexão específica
 func closeConn(userIP, dest string) {
 	connPool.Lock()
 	defer connPool.Unlock()
 
 	if userConns, exists := connPool.conns[userIP]; exists {
 		if pc, exists := userConns[dest]; exists {
-			pc.conn.Close()
+			pc.closed = true
+			if pc.conn != nil {
+				pc.conn.Close()
+			}
 			delete(userConns, dest)
 		}
 	}
@@ -109,8 +125,10 @@ func cleanupConnPool() {
 		now := time.Now()
 		for userIP, userConns := range connPool.conns {
 			for dest, pc := range userConns {
-				if now.Sub(pc.lastUsed) > 60*time.Second {
-					pc.conn.Close()
+				if pc.closed || now.Sub(pc.lastUsed) > 60*time.Second {
+					if pc.conn != nil {
+						pc.conn.Close()
+					}
 					delete(userConns, dest)
 				}
 			}
@@ -120,6 +138,17 @@ func cleanupConnPool() {
 		}
 		connPool.Unlock()
 	}
+}
+
+// Contar conexões ativas
+func countActiveConns() int {
+	connPool.RLock()
+	defer connPool.RUnlock()
+	count := 0
+	for _, userConns := range connPool.conns {
+		count += len(userConns)
+	}
+	return count
 }
 
 var jar, _ = cookiejar.New(nil)
@@ -150,18 +179,18 @@ type UserInfo struct {
 
 var serverStats = struct {
 	sync.RWMutex
-	StartTime      time.Time
-	ActiveTunnels  int
-	TotalTunnels   int64
-	TotalBytes     int64
-	TotalBytesIn   int64
-	TotalBytesOut  int64
-	TotalRequests  int64
-	TotalDNS       int64
-	TotalRelay     int64
-	Users          map[string]*UserInfo
-	PeakUsers      int
-	PeakTunnels    int
+	StartTime     time.Time
+	ActiveTunnels int
+	TotalTunnels  int64
+	TotalBytes    int64
+	TotalBytesIn  int64
+	TotalBytesOut int64
+	TotalRequests int64
+	TotalDNS      int64
+	TotalRelay    int64
+	Users         map[string]*UserInfo
+	PeakUsers     int
+	PeakTunnels   int
 }{
 	Users: make(map[string]*UserInfo),
 }
@@ -183,34 +212,6 @@ func trackUser(ip string) {
 		if len(serverStats.Users) > serverStats.PeakUsers {
 			serverStats.PeakUsers = len(serverStats.Users)
 		}
-	}
-}
-
-func trackTunnelStart(ip string) {
-	serverStats.Lock()
-	defer serverStats.Unlock()
-	serverStats.ActiveTunnels++
-	serverStats.TotalTunnels++
-	if serverStats.ActiveTunnels > serverStats.PeakTunnels {
-		serverStats.PeakTunnels = serverStats.ActiveTunnels
-	}
-	if user, exists := serverStats.Users[ip]; exists {
-		user.ActiveTunnels++
-	}
-}
-
-func trackTunnelEnd(ip string, bytesIn, bytesOut int64) {
-	serverStats.Lock()
-	defer serverStats.Unlock()
-	serverStats.ActiveTunnels--
-	serverStats.TotalBytesIn += bytesIn
-	serverStats.TotalBytesOut += bytesOut
-	serverStats.TotalBytes += bytesIn + bytesOut
-	if user, exists := serverStats.Users[ip]; exists {
-		user.ActiveTunnels--
-		user.BytesIn += bytesIn
-		user.BytesOut += bytesOut
-		user.LastSeen = time.Now()
 	}
 }
 
@@ -261,7 +262,7 @@ func getOnlineUsers() int {
 	defer serverStats.RUnlock()
 	count := 0
 	for _, user := range serverStats.Users {
-		if user.ActiveTunnels > 0 || time.Since(user.LastSeen) < 2*time.Minute {
+		if time.Since(user.LastSeen) < 2*time.Minute {
 			count++
 		}
 	}
@@ -277,7 +278,7 @@ func main() {
 
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
-	fmt.Println("  Porta 80 - Relay Mode (Anti-DPI)")
+	fmt.Println("  Porta 80 - Relay com Conexões Persistentes")
 	fmt.Println("══════════════════════════════════════════════")
 
 	ln, err := net.Listen("tcp", ":80")
@@ -288,9 +289,7 @@ func main() {
 
 	fmt.Println("  ✓ Porta 80 ativa")
 	fmt.Println("  ✓ DNS:         /tunnel (POST)")
-	fmt.Println("  ✓ Relay:       /relay (POST) - NOVO!")
-	fmt.Println("  ✓ HTTP Fetch:  /fetch (POST) - NOVO!")
-	fmt.Println("  ✓ VPN Connect: /vpn-connect (legado)")
+	fmt.Println("  ✓ Relay:       /relay (POST) - PERSISTENTE!")
 	fmt.Println("  ✓ Stats:       /stats")
 	fmt.Println("══════════════════════════════════════════════")
 
@@ -302,13 +301,13 @@ func main() {
 			time.Sleep(60 * time.Second)
 			online := getOnlineUsers()
 			active := getActiveUsers()
+			conns := countActiveConns()
 			serverStats.RLock()
-			tunnels := serverStats.ActiveTunnels
 			totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
 			relayCount := serverStats.TotalRelay
 			serverStats.RUnlock()
-			fmt.Printf("[STATS] Online: %d | Ativos: %d | Túneis: %d | Relay: %d | Total: %.2f MB\n",
-				online, active, tunnels, relayCount, totalMB)
+			fmt.Printf("[STATS] Online: %d | Ativos: %d | Conns: %d | Relay: %d | Total: %.2f MB\n",
+				online, active, conns, relayCount, totalMB)
 		}
 	}()
 
@@ -362,34 +361,14 @@ func handle(conn net.Conn) {
 	fmt.Printf("[%s] %s %s de %s\n", time.Now().Format("15:04:05"), method, path, remoteIP)
 
 	switch {
-	// ════════════════════════════════════════════════════════════════════
-	//              NOVO: /relay - TCP Relay via POST
-	// ════════════════════════════════════════════════════════════════════
 	case path == "/relay" && method == "POST":
-		handleRelay(conn, reader, contentLength, remoteIP)
-
-	// ════════════════════════════════════════════════════════════════════
-	//              NOVO: /fetch - HTTP Fetch via POST
-	// ════════════════════════════════════════════════════════════════════
-	case path == "/fetch" && method == "POST":
-		handleFetch(conn, reader, contentLength, remoteIP)
+		handleRelayPersistent(conn, reader, contentLength, remoteIP)
 
 	case path == "/tunnel" && method == "POST":
 		handleTunnel(conn, reader, contentLength, remoteIP)
 
-	case path == "/vpn-connect" || strings.HasPrefix(path, "/vpn-connect"):
-		dest := headers["x-dest"]
-		if dest == "" {
-			send(conn, 400, "text/plain", []byte("Missing X-Dest header"))
-			return
-		}
-		handleVpnConnect(conn, reader, dest, remoteIP)
-
 	case path == "/stats":
 		sendStats(conn)
-
-	case path == "/stats/users":
-		sendUserStats(conn)
 
 	case path == "/vpn-status":
 		sendVPNStatus(conn)
@@ -419,19 +398,10 @@ func handle(conn net.Conn) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//              NOVO: RELAY - TCP via POST (Anti-DPI)
+//              RELAY COM CONEXÕES PERSISTENTES
 // ════════════════════════════════════════════════════════════════════
 
-// Formato do request:
-// POST /relay
-// Content-Type: application/octet-stream
-// X-Dest: host:port
-// X-Action: connect|send|close
-// Body: dados a enviar (base64 se necessário)
-
-func handleRelay(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
-	// Ler headers já foram lidos, precisamos pegar do body
-
+func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
 	body := make([]byte, contentLength)
 	if contentLength > 0 {
 		_, err := io.ReadFull(reader, body)
@@ -444,13 +414,12 @@ func handleRelay(conn net.Conn, reader *bufio.Reader, contentLength int, remoteI
 	// Parse JSON request
 	var req struct {
 		Dest   string `json:"dest"`
-		Action string `json:"action"` // connect, send, recv, close
+		Action string `json:"action"` // send, close
 		Data   string `json:"data"`   // base64 encoded
 	}
 
 	if err := json.Unmarshal(body, &req); err != nil {
-		// Fallback: formato binário simples
-		// [2 bytes dest len][dest][data]
+		// Fallback: formato binário
 		if len(body) >= 2 {
 			destLen := int(binary.BigEndian.Uint16(body[:2]))
 			if destLen > 0 && destLen < 256 && 2+destLen <= len(body) {
@@ -466,183 +435,100 @@ func handleRelay(conn net.Conn, reader *bufio.Reader, contentLength int, remoteI
 		return
 	}
 
-	fmt.Printf("[RELAY] %s -> %s (%s)\n", remoteIP, req.Dest, req.Action)
-
-	switch req.Action {
-	case "connect":
-		// Apenas estabelecer conexão
-		pc, err := getOrCreateConn(remoteIP, req.Dest)
-		if err != nil {
-			fmt.Printf("[RELAY] Erro connect: %v\n", err)
-			send(conn, 502, "application/json", []byte(fmt.Sprintf(`{"error":"connect failed: %s"}`, err.Error())))
-			return
-		}
-		_ = pc
-		send(conn, 200, "application/json", []byte(`{"status":"connected"}`))
-
-	case "send", "":
-		// Enviar dados e receber resposta
-		dataBytes, _ := base64.StdEncoding.DecodeString(req.Data)
-
-		// Criar conexão temporária (não reutilizar)
-		targetConn, err := net.DialTimeout("tcp", req.Dest, 10*time.Second)
-		if err != nil {
-			fmt.Printf("[RELAY] Erro dial: %v\n", err)
-			send(conn, 502, "application/json", []byte(fmt.Sprintf(`{"error":"dial failed: %s"}`, err.Error())))
-			return
-		}
-		defer targetConn.Close()
-
-		// Enviar dados
-		if len(dataBytes) > 0 {
-			targetConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_, err = targetConn.Write(dataBytes)
-			if err != nil {
-				fmt.Printf("[RELAY] Erro write: %v\n", err)
-				send(conn, 502, "application/json", []byte(`{"error":"write failed"}`))
-				return
-			}
-		}
-
-		// Ler resposta com timeout
-		targetConn.SetReadDeadline(time.Now().Add(15 * time.Second))
-		response := make([]byte, 0, 65536)
-		buf := make([]byte, 4096)
-
-		for {
-			n, err := targetConn.Read(buf)
-			if n > 0 {
-				response = append(response, buf[:n]...)
-				// Se recebemos dados, continuar lendo até timeout curto
-				targetConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			}
-			if err != nil {
-				break
-			}
-			// Limite de 1MB
-			if len(response) > 1024*1024 {
-				break
-			}
-		}
-
-		trackRelay(int64(len(dataBytes)), int64(len(response)))
-
-		fmt.Printf("[RELAY] Resposta: %d bytes\n", len(response))
-
-		// Responder com dados em base64
-		respJSON := map[string]interface{}{
-			"status": "ok",
-			"data":   base64.StdEncoding.EncodeToString(response),
-			"size":   len(response),
-		}
-		jsonBytes, _ := json.Marshal(respJSON)
-		send(conn, 200, "application/json", jsonBytes)
-
-	case "close":
+	// Ação close
+	if req.Action == "close" {
 		closeConn(remoteIP, req.Dest)
 		send(conn, 200, "application/json", []byte(`{"status":"closed"}`))
-
-	default:
-		send(conn, 400, "application/json", []byte(`{"error":"invalid action"}`))
+		return
 	}
-}
 
-// ════════════════════════════════════════════════════════════════════
-//              NOVO: FETCH - HTTP Request via POST
-// ════════════════════════════════════════════════════════════════════
+	// Decodificar dados
+	dataBytes, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		dataBytes = []byte{}
+	}
 
-// Formato:
-// POST /fetch
-// Body: {"url":"https://...", "method":"GET", "headers":{}, "body":""}
+	fmt.Printf("[RELAY] %s -> %s (%d bytes)\n", remoteIP, req.Dest, len(dataBytes))
 
-func handleFetch(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
-	body := make([]byte, contentLength)
-	if contentLength > 0 {
-		_, err := io.ReadFull(reader, body)
+	// Obter ou criar conexão persistente
+	pc, isNew, err := getOrCreateConn(remoteIP, req.Dest)
+	if err != nil {
+		fmt.Printf("[RELAY] Erro conexão: %v\n", err)
+		send(conn, 502, "application/json", []byte(fmt.Sprintf(`{"error":"connect failed: %s"}`, err.Error())))
+		return
+	}
+
+	if isNew {
+		fmt.Printf("[RELAY] Nova conexão para %s\n", req.Dest)
+	}
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// Enviar dados
+	if len(dataBytes) > 0 {
+		pc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, err = pc.conn.Write(dataBytes)
 		if err != nil {
-			send(conn, 400, "application/json", []byte(`{"error":"read error"}`))
+			fmt.Printf("[RELAY] Erro write: %v\n", err)
+			pc.closed = true
+			closeConn(remoteIP, req.Dest)
+			send(conn, 502, "application/json", []byte(`{"error":"write failed"}`))
 			return
 		}
 	}
 
-	var req struct {
-		URL     string            `json:"url"`
-		Method  string            `json:"method"`
-		Headers map[string]string `json:"headers"`
-		Body    string            `json:"body"`
-	}
+	// Ler resposta com timeout curto
+	// TLS pode precisar de múltiplas trocas, então não esperamos muito
+	pc.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 
-	if err := json.Unmarshal(body, &req); err != nil {
-		send(conn, 400, "application/json", []byte(`{"error":"invalid json"}`))
-		return
-	}
+	response := make([]byte, 0, 65536)
+	buf := make([]byte, 8192)
 
-	if req.URL == "" {
-		send(conn, 400, "application/json", []byte(`{"error":"missing url"}`))
-		return
-	}
-
-	if req.Method == "" {
-		req.Method = "GET"
-	}
-
-	fmt.Printf("[FETCH] %s %s\n", req.Method, req.URL)
-
-	// Criar request
-	var bodyReader io.Reader
-	if req.Body != "" {
-		bodyReader = strings.NewReader(req.Body)
-	}
-
-	httpReq, err := http.NewRequest(req.Method, req.URL, bodyReader)
-	if err != nil {
-		send(conn, 400, "application/json", []byte(fmt.Sprintf(`{"error":"invalid request: %s"}`, err.Error())))
-		return
-	}
-
-	// Adicionar headers
-	httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
-	}
-
-	// Fazer request
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		fmt.Printf("[FETCH] Erro: %v\n", err)
-		send(conn, 502, "application/json", []byte(fmt.Sprintf(`{"error":"request failed: %s"}`, err.Error())))
-		return
-	}
-	defer resp.Body.Close()
-
-	// Ler resposta
-	respBody, _ := io.ReadAll(resp.Body)
-
-	// Coletar headers de resposta
-	respHeaders := make(map[string]string)
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			respHeaders[k] = v[0]
+	for {
+		n, err := pc.conn.Read(buf)
+		if n > 0 {
+			response = append(response, buf[:n]...)
+			// Se recebemos dados, dar mais tempo para ler mais
+			pc.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		}
+		if err != nil {
+			// Timeout é esperado quando não há mais dados
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break
+			}
+			// Conexão fechada pelo servidor
+			if err == io.EOF {
+				pc.closed = true
+				break
+			}
+			break
+		}
+		// Limite de 1MB
+		if len(response) > 1024*1024 {
+			break
 		}
 	}
 
-	trackRelay(int64(len(body)), int64(len(respBody)))
+	pc.lastUsed = time.Now()
 
-	fmt.Printf("[FETCH] Resposta: %d bytes (status %d)\n", len(respBody), resp.StatusCode)
+	trackRelay(int64(len(dataBytes)), int64(len(response)))
+
+	fmt.Printf("[RELAY] Resposta: %d bytes\n", len(response))
 
 	// Responder
-	response := map[string]interface{}{
-		"status":  resp.StatusCode,
-		"headers": respHeaders,
-		"body":    base64.StdEncoding.EncodeToString(respBody),
-		"size":    len(respBody),
+	respJSON := map[string]interface{}{
+		"status": "ok",
+		"data":   base64.StdEncoding.EncodeToString(response),
+		"size":   len(response),
+		"new":    isNew,
 	}
-	jsonBytes, _ := json.Marshal(response)
+	jsonBytes, _ := json.Marshal(respJSON)
 	send(conn, 200, "application/json", jsonBytes)
 }
 
 // ════════════════════════════════════════════════════════════════════
-//                         VPN TUNNEL HANDLERS (Original)
+//                         DNS TUNNEL
 // ════════════════════════════════════════════════════════════════════
 
 func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
@@ -701,6 +587,7 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
+	// Para outras portas, usar relay
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		send(conn, 502, "text/plain", []byte("Connection failed: "+err.Error()))
@@ -761,53 +648,6 @@ func handleDNS(dest string, query []byte) []byte {
 	return response[:n]
 }
 
-func handleVpnConnect(conn net.Conn, reader *bufio.Reader, dest string, remoteIP string) {
-	fmt.Printf("[VPN-CONNECT] %s -> %s\n", remoteIP, dest)
-
-	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
-	if err != nil {
-		send(conn, 502, "text/plain", []byte("Connection failed: "+err.Error()))
-		return
-	}
-
-	response := "HTTP/1.1 200 OK\r\n" +
-		"Content-Type: application/octet-stream\r\n" +
-		"Connection: keep-alive\r\n\r\n"
-	conn.Write([]byte(response))
-
-	trackTunnelStart(remoteIP)
-	fmt.Printf("[VPN-CONNECT] ✓ Túnel ativo: %s <-> %s\n", remoteIP, dest)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	var bytesUp, bytesDown int64
-
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(targetConn, reader)
-		bytesUp = n
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(conn, targetConn)
-		bytesDown = n
-		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-	}()
-
-	wg.Wait()
-	targetConn.Close()
-
-	trackTunnelEnd(remoteIP, bytesDown, bytesUp)
-	fmt.Printf("[VPN-CONNECT] ✗ Túnel fechado: %s (↑%d ↓%d bytes)\n", remoteIP, bytesUp, bytesDown)
-}
-
 // ════════════════════════════════════════════════════════════════════
 //                         ESTATÍSTICAS
 // ════════════════════════════════════════════════════════════════════
@@ -816,26 +656,19 @@ func sendStats(conn net.Conn) {
 	serverStats.RLock()
 	uptime := time.Since(serverStats.StartTime)
 
-	onlineUsers := getOnlineUsers()
-	activeUsers := getActiveUsers()
-
 	stats := map[string]interface{}{
 		"status":         "online",
 		"version":        SERVER_VERSION,
 		"uptime":         uptime.String(),
 		"uptime_seconds": int64(uptime.Seconds()),
 		"users": map[string]int{
-			"online": onlineUsers,
-			"active": activeUsers,
+			"online": getOnlineUsers(),
+			"active": getActiveUsers(),
 			"total":  len(serverStats.Users),
 			"peak":   serverStats.PeakUsers,
 		},
-		"tunnels": map[string]interface{}{
-			"active": serverStats.ActiveTunnels,
-			"total":  serverStats.TotalTunnels,
-			"peak":   serverStats.PeakTunnels,
-		},
-		"relay": serverStats.TotalRelay,
+		"connections": countActiveConns(),
+		"relay":       serverStats.TotalRelay,
 		"traffic": map[string]interface{}{
 			"total_bytes": serverStats.TotalBytes,
 			"total_mb":    float64(serverStats.TotalBytes) / 1024 / 1024,
@@ -857,44 +690,17 @@ func sendStats(conn net.Conn) {
 	send(conn, 200, "application/json", jsonData)
 }
 
-func sendUserStats(conn net.Conn) {
-	serverStats.RLock()
-	users := make([]map[string]interface{}, 0)
-
-	for _, user := range serverStats.Users {
-		users = append(users, map[string]interface{}{
-			"ip":             user.IP,
-			"active_tunnels": user.ActiveTunnels,
-			"bytes_in":       user.BytesIn,
-			"bytes_out":      user.BytesOut,
-			"requests":       user.Requests,
-			"first_seen":     user.FirstSeen.Format("15:04:05"),
-			"last_seen":      user.LastSeen.Format("15:04:05"),
-			"online":         user.ActiveTunnels > 0,
-		})
-	}
-	serverStats.RUnlock()
-
-	response := map[string]interface{}{
-		"total_users": len(users),
-		"users":       users,
-	}
-
-	jsonData, _ := json.MarshalIndent(response, "", "  ")
-	send(conn, 200, "application/json", jsonData)
-}
-
 func sendVPNStatus(conn net.Conn) {
 	serverStats.RLock()
-	active := serverStats.ActiveTunnels
 	total := serverStats.TotalBytes
 	relay := serverStats.TotalRelay
 	serverStats.RUnlock()
 
+	conns := countActiveConns()
 	online := getOnlineUsers()
 
-	json := fmt.Sprintf(`{"status":"online","version":"%s","online_users":%d,"active_tunnels":%d,"total_bytes":%d,"relay_count":%d}`,
-		SERVER_VERSION, online, active, total, relay)
+	json := fmt.Sprintf(`{"status":"online","version":"%s","online_users":%d,"active_conns":%d,"total_bytes":%d,"relay_count":%d}`,
+		SERVER_VERSION, online, conns, total, relay)
 	send(conn, 200, "application/json", []byte(json))
 }
 
@@ -1014,9 +820,9 @@ func rewriteCSS(body []byte, base string) []byte {
 func sendHome(conn net.Conn) {
 	online := getOnlineUsers()
 	active := getActiveUsers()
+	conns := countActiveConns()
 
 	serverStats.RLock()
-	tunnels := serverStats.ActiveTunnels
 	totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
 	relay := serverStats.TotalRelay
 	uptime := time.Since(serverStats.StartTime)
@@ -1024,7 +830,7 @@ func sendHome(conn net.Conn) {
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GratisBet VPN v3</title>
+<title>GratisBet VPN v3.1</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;min-height:100vh}
@@ -1038,18 +844,18 @@ h1{color:#00c853;text-align:center;margin:20px 0}
 .badge{background:#00c853;color:#000;padding:5px 15px;border-radius:20px;font-size:12px;display:inline-block;margin:10px 0}
 </style></head><body>
 <h1>🛡️ GratisBet VPN</h1>
-<div class="badge">v%s - Relay Mode</div>
+<div class="badge">v%s - Persistent Connections</div>
 <div class="status">
 <p class="online">● %d Online</p>
 <div class="stats-grid">
 <div class="stat"><div class="stat-label">Ativos</div><div class="stat-value">%d</div></div>
-<div class="stat"><div class="stat-label">Túneis</div><div class="stat-value">%d</div></div>
+<div class="stat"><div class="stat-label">Conexões</div><div class="stat-value">%d</div></div>
 <div class="stat"><div class="stat-label">Relay</div><div class="stat-value">%d</div></div>
 <div class="stat"><div class="stat-label">Tráfego</div><div class="stat-value">%.1f MB</div></div>
 <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value">%s</div></div>
 </div>
 </div>
-</body></html>`, SERVER_VERSION, online, active, tunnels, relay, totalMB, formatDuration(uptime))
+</body></html>`, SERVER_VERSION, online, active, conns, relay, totalMB, formatDuration(uptime))
 	send(conn, 200, "text/html; charset=utf-8", []byte(html))
 }
 
