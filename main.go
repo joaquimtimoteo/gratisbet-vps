@@ -20,30 +20,40 @@ import (
 	"time"
 )
 
-// API Keys
-const FOOTBALL_API_KEY = "416ad7217f99978b716b399ea3d08edc"
-const YOUTUBE_API_KEY = "AIzaSyCxFo3x8k0BCQEEfNQLFS-6HWux4--0sjY"
+const SERVER_VERSION = "3.2-xor"
 
-// Versão do servidor
-const SERVER_VERSION = "3.1-persistent"
+// ════════════════════════════════════════════════════════════════════
+//                    XOR OBFUSCATION KEY
+// ════════════════════════════════════════════════════════════════════
+
+// Chave XOR - deve ser a mesma no app Android!
+var XOR_KEY = []byte{0x47, 0x72, 0x61, 0x74, 0x69, 0x73, 0x42, 0x65, 0x74, 0x41, 0x6E, 0x67, 0x6F, 0x6C, 0x61, 0x21}
+
+// "GratisBetAngola!"
+
+func xorData(data []byte) []byte {
+	result := make([]byte, len(data))
+	keyLen := len(XOR_KEY)
+	for i := 0; i < len(data); i++ {
+		result[i] = data[i] ^ XOR_KEY[i%keyLen]
+	}
+	return result
+}
 
 // ════════════════════════════════════════════════════════════════════
 //                    POOL DE CONEXÕES PERSISTENTES
 // ════════════════════════════════════════════════════════════════════
 
-// Conexão persistente com destino
 type PersistentConn struct {
-	conn       net.Conn
-	dest       string
-	userIP     string
-	createdAt  time.Time
-	lastUsed   time.Time
-	mu         sync.Mutex
-	readBuffer []byte
-	closed     bool
+	conn      net.Conn
+	dest      string
+	userIP    string
+	createdAt time.Time
+	lastUsed  time.Time
+	mu        sync.Mutex
+	closed    bool
 }
 
-// Pool de conexões: userIP -> dest -> *PersistentConn
 var connPool = struct {
 	sync.RWMutex
 	conns map[string]map[string]*PersistentConn
@@ -51,7 +61,6 @@ var connPool = struct {
 	conns: make(map[string]map[string]*PersistentConn),
 }
 
-// Obter ou criar conexão persistente
 func getOrCreateConn(userIP, dest string) (*PersistentConn, bool, error) {
 	connPool.Lock()
 	defer connPool.Unlock()
@@ -60,26 +69,22 @@ func getOrCreateConn(userIP, dest string) (*PersistentConn, bool, error) {
 		connPool.conns[userIP] = make(map[string]*PersistentConn)
 	}
 
-	// Verificar se já existe conexão válida
 	if pc, exists := connPool.conns[userIP][dest]; exists {
 		if !pc.closed && time.Since(pc.lastUsed) < 60*time.Second {
 			pc.lastUsed = time.Now()
-			return pc, false, nil // false = não é nova
+			return pc, false, nil
 		}
-		// Conexão expirada ou fechada, limpar
 		if pc.conn != nil {
 			pc.conn.Close()
 		}
 		delete(connPool.conns[userIP], dest)
 	}
 
-	// Criar nova conexão
 	conn, err := net.DialTimeout("tcp", dest, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
 
-	// Configurar TCP
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -87,20 +92,18 @@ func getOrCreateConn(userIP, dest string) (*PersistentConn, bool, error) {
 	}
 
 	pc := &PersistentConn{
-		conn:       conn,
-		dest:       dest,
-		userIP:     userIP,
-		createdAt:  time.Now(),
-		lastUsed:   time.Now(),
-		readBuffer: make([]byte, 0),
-		closed:     false,
+		conn:      conn,
+		dest:      dest,
+		userIP:    userIP,
+		createdAt: time.Now(),
+		lastUsed:  time.Now(),
+		closed:    false,
 	}
 
 	connPool.conns[userIP][dest] = pc
-	return pc, true, nil // true = é nova conexão
+	return pc, true, nil
 }
 
-// Fechar conexão específica
 func closeConn(userIP, dest string) {
 	connPool.Lock()
 	defer connPool.Unlock()
@@ -116,11 +119,9 @@ func closeConn(userIP, dest string) {
 	}
 }
 
-// Limpar conexões expiradas
 func cleanupConnPool() {
 	for {
 		time.Sleep(30 * time.Second)
-
 		connPool.Lock()
 		now := time.Now()
 		for userIP, userConns := range connPool.conns {
@@ -140,7 +141,6 @@ func cleanupConnPool() {
 	}
 }
 
-// Contar conexões ativas
 func countActiveConns() int {
 	connPool.RLock()
 	defer connPool.RUnlock()
@@ -164,24 +164,19 @@ var lastBase = make(map[string]string)
 var lastBaseMu sync.RWMutex
 
 // ════════════════════════════════════════════════════════════════════
-//                    SISTEMA DE ESTATÍSTICAS
+//                    ESTATÍSTICAS
 // ════════════════════════════════════════════════════════════════════
 
 type UserInfo struct {
-	IP            string
-	FirstSeen     time.Time
-	LastSeen      time.Time
-	ActiveTunnels int
-	BytesIn       int64
-	BytesOut      int64
-	Requests      int64
+	IP        string
+	FirstSeen time.Time
+	LastSeen  time.Time
+	Requests  int64
 }
 
 var serverStats = struct {
 	sync.RWMutex
 	StartTime     time.Time
-	ActiveTunnels int
-	TotalTunnels  int64
 	TotalBytes    int64
 	TotalBytesIn  int64
 	TotalBytesOut int64
@@ -190,7 +185,6 @@ var serverStats = struct {
 	TotalRelay    int64
 	Users         map[string]*UserInfo
 	PeakUsers     int
-	PeakTunnels   int
 }{
 	Users: make(map[string]*UserInfo),
 }
@@ -236,25 +230,12 @@ func cleanupInactiveUsers() {
 		serverStats.Lock()
 		cutoff := time.Now().Add(-30 * time.Minute)
 		for ip, user := range serverStats.Users {
-			if user.ActiveTunnels == 0 && user.LastSeen.Before(cutoff) {
+			if user.LastSeen.Before(cutoff) {
 				delete(serverStats.Users, ip)
 			}
 		}
 		serverStats.Unlock()
 	}
-}
-
-func getActiveUsers() int {
-	serverStats.RLock()
-	defer serverStats.RUnlock()
-	cutoff := time.Now().Add(-5 * time.Minute)
-	count := 0
-	for _, user := range serverStats.Users {
-		if user.ActiveTunnels > 0 || user.LastSeen.After(cutoff) {
-			count++
-		}
-	}
-	return count
 }
 
 func getOnlineUsers() int {
@@ -278,7 +259,7 @@ func main() {
 
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
-	fmt.Println("  Porta 80 - Relay com Conexões Persistentes")
+	fmt.Println("  XOR Obfuscation Enabled")
 	fmt.Println("══════════════════════════════════════════════")
 
 	ln, err := net.Listen("tcp", ":80")
@@ -288,9 +269,10 @@ func main() {
 	}
 
 	fmt.Println("  ✓ Porta 80 ativa")
-	fmt.Println("  ✓ DNS:         /tunnel (POST)")
-	fmt.Println("  ✓ Relay:       /relay (POST) - PERSISTENTE!")
-	fmt.Println("  ✓ Stats:       /stats")
+	fmt.Println("  ✓ DNS:   /tunnel (POST)")
+	fmt.Println("  ✓ Relay: /relay (POST + XOR)")
+	fmt.Println("  ✓ Stats: /stats")
+	fmt.Printf("  ✓ XOR Key: %d bytes\n", len(XOR_KEY))
 	fmt.Println("══════════════════════════════════════════════")
 
 	go cleanupInactiveUsers()
@@ -300,14 +282,13 @@ func main() {
 		for {
 			time.Sleep(60 * time.Second)
 			online := getOnlineUsers()
-			active := getActiveUsers()
 			conns := countActiveConns()
 			serverStats.RLock()
 			totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
 			relayCount := serverStats.TotalRelay
 			serverStats.RUnlock()
-			fmt.Printf("[STATS] Online: %d | Ativos: %d | Conns: %d | Relay: %d | Total: %.2f MB\n",
-				online, active, conns, relayCount, totalMB)
+			fmt.Printf("[STATS] Online: %d | Conns: %d | Relay: %d | Total: %.2f MB\n",
+				online, conns, relayCount, totalMB)
 		}
 	}()
 
@@ -362,7 +343,7 @@ func handle(conn net.Conn) {
 
 	switch {
 	case path == "/relay" && method == "POST":
-		handleRelayPersistent(conn, reader, contentLength, remoteIP)
+		handleRelayXOR(conn, reader, contentLength, remoteIP, headers)
 
 	case path == "/tunnel" && method == "POST":
 		handleTunnel(conn, reader, contentLength, remoteIP)
@@ -398,10 +379,10 @@ func handle(conn net.Conn) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//              RELAY COM CONEXÕES PERSISTENTES
+//              RELAY COM XOR OBFUSCATION
 // ════════════════════════════════════════════════════════════════════
 
-func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
+func handleRelayXOR(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string, headers map[string]string) {
 	body := make([]byte, contentLength)
 	if contentLength > 0 {
 		_, err := io.ReadFull(reader, body)
@@ -411,15 +392,16 @@ func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength in
 		}
 	}
 
-	// Parse JSON request
+	// Verificar se usa XOR
+	useXOR := headers["x-xor"] == "1"
+
 	var req struct {
 		Dest   string `json:"dest"`
-		Action string `json:"action"` // send, close
-		Data   string `json:"data"`   // base64 encoded
+		Action string `json:"action"`
+		Data   string `json:"data"`
 	}
 
 	if err := json.Unmarshal(body, &req); err != nil {
-		// Fallback: formato binário
 		if len(body) >= 2 {
 			destLen := int(binary.BigEndian.Uint16(body[:2]))
 			if destLen > 0 && destLen < 256 && 2+destLen <= len(body) {
@@ -435,7 +417,6 @@ func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength in
 		return
 	}
 
-	// Ação close
 	if req.Action == "close" {
 		closeConn(remoteIP, req.Dest)
 		send(conn, 200, "application/json", []byte(`{"status":"closed"}`))
@@ -448,9 +429,15 @@ func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength in
 		dataBytes = []byte{}
 	}
 
-	fmt.Printf("[RELAY] %s -> %s (%d bytes)\n", remoteIP, req.Dest, len(dataBytes))
+	// Se usa XOR, decodificar (dados vêm ofuscados do app)
+	if useXOR && len(dataBytes) > 0 {
+		dataBytes = xorData(dataBytes)
+		fmt.Printf("[RELAY-XOR] Decodificado %d bytes\n", len(dataBytes))
+	}
 
-	// Obter ou criar conexão persistente
+	fmt.Printf("[RELAY] %s -> %s (%d bytes, xor=%v)\n", remoteIP, req.Dest, len(dataBytes), useXOR)
+
+	// Obter ou criar conexão
 	pc, isNew, err := getOrCreateConn(remoteIP, req.Dest)
 	if err != nil {
 		fmt.Printf("[RELAY] Erro conexão: %v\n", err)
@@ -478,10 +465,8 @@ func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength in
 		}
 	}
 
-	// Ler resposta com timeout curto
-	// TLS pode precisar de múltiplas trocas, então não esperamos muito
+	// Ler resposta
 	pc.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-
 	response := make([]byte, 0, 65536)
 	buf := make([]byte, 8192)
 
@@ -489,39 +474,41 @@ func handleRelayPersistent(conn net.Conn, reader *bufio.Reader, contentLength in
 		n, err := pc.conn.Read(buf)
 		if n > 0 {
 			response = append(response, buf[:n]...)
-			// Se recebemos dados, dar mais tempo para ler mais
 			pc.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		}
 		if err != nil {
-			// Timeout é esperado quando não há mais dados
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				break
 			}
-			// Conexão fechada pelo servidor
 			if err == io.EOF {
 				pc.closed = true
 				break
 			}
 			break
 		}
-		// Limite de 1MB
 		if len(response) > 1024*1024 {
 			break
 		}
 	}
 
 	pc.lastUsed = time.Now()
-
 	trackRelay(int64(len(dataBytes)), int64(len(response)))
 
 	fmt.Printf("[RELAY] Resposta: %d bytes\n", len(response))
 
+	// Se usa XOR, ofuscar resposta
+	responseToSend := response
+	if useXOR && len(response) > 0 {
+		responseToSend = xorData(response)
+		fmt.Printf("[RELAY-XOR] Codificado %d bytes\n", len(responseToSend))
+	}
+
 	// Responder
 	respJSON := map[string]interface{}{
 		"status": "ok",
-		"data":   base64.StdEncoding.EncodeToString(response),
+		"data":   base64.StdEncoding.EncodeToString(responseToSend),
 		"size":   len(response),
-		"new":    isNew,
+		"xor":    useXOR,
 	}
 	jsonBytes, _ := json.Marshal(respJSON)
 	send(conn, 200, "application/json", jsonBytes)
@@ -587,7 +574,6 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	// Para outras portas, usar relay
 	targetConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		send(conn, 502, "text/plain", []byte("Connection failed: "+err.Error()))
@@ -611,18 +597,13 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	trackRelay(int64(len(data)), int64(len(response)))
-
 	fmt.Printf("[TUNNEL] Resposta: %d bytes\n", len(response))
 	send(conn, 200, "application/octet-stream", response)
 }
 
 func handleDNS(dest string, query []byte) []byte {
 	dnsServer := "8.8.8.8:53"
-
-	if strings.HasPrefix(dest, "10.") || strings.HasPrefix(dest, "192.168.") || strings.HasPrefix(dest, "172.") {
-		dnsServer = "8.8.8.8:53"
-	} else if dest != "8.8.8.8:53" && dest != "8.8.4.4:53" {
+	if dest != "8.8.8.8:53" && dest != "8.8.4.4:53" && !strings.HasPrefix(dest, "10.") && !strings.HasPrefix(dest, "192.168.") {
 		dnsServer = dest
 	}
 
@@ -657,32 +638,16 @@ func sendStats(conn net.Conn) {
 	uptime := time.Since(serverStats.StartTime)
 
 	stats := map[string]interface{}{
-		"status":         "online",
-		"version":        SERVER_VERSION,
-		"uptime":         uptime.String(),
-		"uptime_seconds": int64(uptime.Seconds()),
-		"users": map[string]int{
-			"online": getOnlineUsers(),
-			"active": getActiveUsers(),
-			"total":  len(serverStats.Users),
-			"peak":   serverStats.PeakUsers,
-		},
+		"status":      "online",
+		"version":     SERVER_VERSION,
+		"uptime":      uptime.String(),
+		"online":      getOnlineUsers(),
 		"connections": countActiveConns(),
 		"relay":       serverStats.TotalRelay,
-		"traffic": map[string]interface{}{
-			"total_bytes": serverStats.TotalBytes,
-			"total_mb":    float64(serverStats.TotalBytes) / 1024 / 1024,
-			"bytes_in":    serverStats.TotalBytesIn,
-			"bytes_out":   serverStats.TotalBytesOut,
-		},
-		"requests": map[string]int64{
-			"total": serverStats.TotalRequests,
-			"dns":   serverStats.TotalDNS,
-		},
-		"system": map[string]interface{}{
-			"goroutines": runtime.NumGoroutine(),
-			"cpus":       runtime.NumCPU(),
-		},
+		"dns":         serverStats.TotalDNS,
+		"total_mb":    float64(serverStats.TotalBytes) / 1024 / 1024,
+		"xor_enabled": true,
+		"goroutines":  runtime.NumGoroutine(),
 	}
 	serverStats.RUnlock()
 
@@ -696,11 +661,8 @@ func sendVPNStatus(conn net.Conn) {
 	relay := serverStats.TotalRelay
 	serverStats.RUnlock()
 
-	conns := countActiveConns()
-	online := getOnlineUsers()
-
-	json := fmt.Sprintf(`{"status":"online","version":"%s","online_users":%d,"active_conns":%d,"total_bytes":%d,"relay_count":%d}`,
-		SERVER_VERSION, online, conns, total, relay)
+	json := fmt.Sprintf(`{"status":"online","version":"%s","online":%d,"conns":%d,"bytes":%d,"relay":%d,"xor":true}`,
+		SERVER_VERSION, getOnlineUsers(), countActiveConns(), total, relay)
 	send(conn, 200, "application/json", []byte(json))
 }
 
@@ -729,8 +691,6 @@ func doProxy(conn net.Conn, path string, remoteIP string) {
 }
 
 func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
-	fmt.Printf("[PROXY] %s\n", targetURL)
-
 	parsed, err := url.Parse(targetURL)
 	if err != nil {
 		send(conn, 400, "text/plain", []byte("Invalid URL"))
@@ -745,7 +705,6 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	req, _ := http.NewRequest("GET", targetURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "pt-PT,pt;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip")
 
 	resp, err := client.Do(req)
@@ -769,11 +728,9 @@ func doProxyURL(conn net.Conn, targetURL string, remoteIP string) {
 	}
 
 	ct := resp.Header.Get("Content-Type")
-
 	if strings.Contains(ct, "text/html") {
 		body = rewriteHTML(body, base)
 	}
-
 	if strings.Contains(ct, "text/css") {
 		body = rewriteCSS(body, base)
 	}
@@ -791,9 +748,7 @@ func rewriteHTML(body []byte, base string) []byte {
 		if len(parts) == 3 {
 			attr := parts[1]
 			urlStr := parts[2]
-			if strings.Contains(urlStr, "facebook.com") ||
-				strings.Contains(urlStr, "google") ||
-				strings.Contains(urlStr, "analytics") {
+			if strings.Contains(urlStr, "facebook.com") || strings.Contains(urlStr, "google") || strings.Contains(urlStr, "analytics") {
 				return fmt.Sprintf(`%s=""`, attr)
 			}
 			return fmt.Sprintf(`%s="/proxy?url=%s"`, attr, url.QueryEscape(urlStr))
@@ -810,18 +765,14 @@ func rewriteHTML(body []byte, base string) []byte {
 func rewriteCSS(body []byte, base string) []byte {
 	css := string(body)
 	encodedBase := url.QueryEscape(base)
-
 	re := regexp.MustCompile(`url\(['"]?(/[^'")]+)['"]?\)`)
 	css = re.ReplaceAllString(css, `url(/proxy?url=`+encodedBase+`$1)`)
-
 	return []byte(css)
 }
 
 func sendHome(conn net.Conn) {
 	online := getOnlineUsers()
-	active := getActiveUsers()
 	conns := countActiveConns()
-
 	serverStats.RLock()
 	totalMB := float64(serverStats.TotalBytes) / 1024 / 1024
 	relay := serverStats.TotalRelay
@@ -830,32 +781,31 @@ func sendHome(conn net.Conn) {
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GratisBet VPN v3.1</title>
+<title>GratisBet VPN</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;min-height:100vh}
+body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px}
 h1{color:#00c853;text-align:center;margin:20px 0}
+.badge{background:#00c853;color:#000;padding:5px 15px;border-radius:20px;font-size:12px;display:inline-block;margin:10px auto;text-align:center}
 .status{background:#2d2d44;border-radius:15px;padding:20px;text-align:center;margin:20px auto;max-width:400px}
-.online{color:#00c853;font-size:24px;margin-bottom:15px}
-.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.online{color:#00c853;font-size:24px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:15px}
 .stat{background:#1a1a2e;padding:10px;border-radius:8px}
-.stat-label{color:#888;font-size:12px}
-.stat-value{color:#fff;font-size:18px;font-weight:bold}
-.badge{background:#00c853;color:#000;padding:5px 15px;border-radius:20px;font-size:12px;display:inline-block;margin:10px 0}
+.label{color:#888;font-size:12px}
+.value{color:#fff;font-size:18px;font-weight:bold}
 </style></head><body>
 <h1>🛡️ GratisBet VPN</h1>
-<div class="badge">v%s - Persistent Connections</div>
+<center><div class="badge">v%s - XOR Obfuscation</div></center>
 <div class="status">
 <p class="online">● %d Online</p>
-<div class="stats-grid">
-<div class="stat"><div class="stat-label">Ativos</div><div class="stat-value">%d</div></div>
-<div class="stat"><div class="stat-label">Conexões</div><div class="stat-value">%d</div></div>
-<div class="stat"><div class="stat-label">Relay</div><div class="stat-value">%d</div></div>
-<div class="stat"><div class="stat-label">Tráfego</div><div class="stat-value">%.1f MB</div></div>
-<div class="stat"><div class="stat-label">Uptime</div><div class="stat-value">%s</div></div>
+<div class="grid">
+<div class="stat"><div class="label">Conexões</div><div class="value">%d</div></div>
+<div class="stat"><div class="label">Relay</div><div class="value">%d</div></div>
+<div class="stat"><div class="label">Tráfego</div><div class="value">%.1f MB</div></div>
+<div class="stat"><div class="label">Uptime</div><div class="value">%s</div></div>
 </div>
 </div>
-</body></html>`, SERVER_VERSION, online, active, conns, relay, totalMB, formatDuration(uptime))
+</body></html>`, SERVER_VERSION, online, conns, relay, totalMB, formatDuration(uptime))
 	send(conn, 200, "text/html; charset=utf-8", []byte(html))
 }
 
