@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"network-scanner-edu/pkg/reporter"
-	"network-scanner-edu/pkg/scanner"
+	"pkg/reporter"
+	"pkg/scanner"
 )
 
 // Config armazena configurações da linha de comando
