@@ -38,6 +38,7 @@ type TcpConn struct {
 	lastUsed time.Time
 	mu       sync.Mutex
 	closed   bool
+	reading  bool
 }
 
 type UserSession struct {
@@ -72,11 +73,20 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if tc, ok := s.conns[dest]; ok && !tc.closed {
-		tc.lastUsed = time.Now()
-		return tc, false, nil
+	// Verificar se já existe conexão válida
+	if tc, ok := s.conns[dest]; ok {
+		if !tc.closed && time.Since(tc.lastUsed) < 120*time.Second {
+			tc.lastUsed = time.Now()
+			return tc, false, nil // false = não é nova
+		}
+		// Conexão expirada, fechar
+		if tc.conn != nil {
+			tc.conn.Close()
+		}
+		delete(s.conns, dest)
 	}
 
+	// Criar nova conexão
 	conn, err := net.DialTimeout("tcp", dest, 15*time.Second)
 	if err != nil {
 		return nil, false, err
@@ -92,30 +102,58 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 		conn:     conn,
 		dest:     dest,
 		lastUsed: time.Now(),
+		reading:  false,
 	}
 	s.conns[dest] = tc
 
-	// Iniciar goroutine para ler respostas
+	// Iniciar goroutine para ler respostas (apenas uma vez)
+	tc.reading = true
 	go s.readFromTcp(tc, dest)
 
-	return tc, true, nil
+	return tc, true, nil // true = é nova
 }
 
 func (s *UserSession) readFromTcp(tc *TcpConn, dest string) {
 	buf := make([]byte, 32768)
+	emptyReads := 0
+	
 	for !tc.closed {
-		tc.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// Timeout de leitura mais longo - 120 segundos
+		tc.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		n, err := tc.conn.Read(buf)
+		
 		if n > 0 {
+			emptyReads = 0
+			tc.lastUsed = time.Now()
 			// Enviar dados de volta via WebSocket
 			s.sendToWs(dest, buf[:n])
+			addBytes(int64(n))
 		}
+		
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Timeout - verificar se conexão ainda é necessária
+				if time.Since(tc.lastUsed) > 120*time.Second {
+					break // Conexão ociosa por muito tempo
+				}
+				emptyReads++
+				if emptyReads > 5 {
+					break // Muitos timeouts seguidos
+				}
+				continue // Continuar tentando ler
+			}
+			// Erro real - fechar
 			break
 		}
 	}
+	
 	tc.closed = true
 	tc.conn.Close()
+	
+	// Remover do pool
+	s.mu.Lock()
+	delete(s.conns, dest)
+	s.mu.Unlock()
 }
 
 func (s *UserSession) sendToWs(dest string, data []byte) {
@@ -148,11 +186,11 @@ func (s *UserSession) closeTcp(dest string) {
 
 func cleanupSessions() {
 	for {
-		time.Sleep(60 * time.Second)
+		time.Sleep(120 * time.Second) // Verificar a cada 2 minutos
 		sessions.Lock()
 		now := time.Now()
 		for ip, s := range sessions.m {
-			if now.Sub(s.lastSeen) > 10*time.Minute {
+			if now.Sub(s.lastSeen) > 30*time.Minute { // 30 minutos de inatividade
 				s.mu.Lock()
 				for _, tc := range s.conns {
 					tc.closed = true
@@ -203,6 +241,18 @@ func addWs(delta int64) {
 	stats.Unlock()
 }
 
+func countTcpConns() int {
+	sessions.RLock()
+	defer sessions.RUnlock()
+	count := 0
+	for _, s := range sessions.m {
+		s.mu.RLock()
+		count += len(s.conns)
+		s.mu.RUnlock()
+	}
+	return count
+}
+
 func getOnlineUsers() int {
 	sessions.RLock()
 	defer sessions.RUnlock()
@@ -247,8 +297,9 @@ func main() {
 			relay := stats.TotalRelay
 			ws := stats.WsConns
 			stats.RUnlock()
-			fmt.Printf("[STATS] Online: %d | WS: %d | Relay: %d | %.2f MB\n",
-				getOnlineUsers(), ws, relay, mb)
+			tcpConns := countTcpConns()
+			fmt.Printf("[STATS] Online: %d | WS: %d | TCP: %d | Relay: %d | %.2f MB\n",
+				getOnlineUsers(), ws, tcpConns, relay, mb)
 		}
 	}()
 
@@ -449,18 +500,19 @@ func handleWsTcp(session *UserSession, payload []byte, remoteIP string) {
 
 	tc, isNew, err := session.getOrCreateTcp(dest)
 	if err != nil {
-		fmt.Printf("[WS-TCP] Erro conectando %s: %v\n", dest, err)
+		// Só logar erros reais, não cada tentativa
 		return
 	}
 
 	if isNew {
-		fmt.Printf("[WS-TCP] Nova conexão: %s\n", dest)
+		fmt.Printf("[TCP+] %s\n", dest)
 	}
 
 	tc.mu.Lock()
 	if len(data) > 0 {
 		tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		tc.conn.Write(data)
+		tc.lastUsed = time.Now()
 	}
 	tc.mu.Unlock()
 }
@@ -685,6 +737,7 @@ func sendStats(conn net.Conn) {
 		"version":    SERVER_VERSION,
 		"online":     getOnlineUsers(),
 		"websockets": stats.WsConns,
+		"tcp_conns":  countTcpConns(),
 		"relay":      stats.TotalRelay,
 		"dns":        stats.TotalDNS,
 		"mb":         float64(stats.TotalBytes) / 1024 / 1024,
