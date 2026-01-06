@@ -75,14 +75,15 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 
 	// Verificar se já existe conexão válida
 	if tc, ok := s.conns[dest]; ok {
-		if !tc.closed && time.Since(tc.lastUsed) < 120*time.Second {
+		tc.mu.Lock()
+		isClosed := tc.closed
+		tc.mu.Unlock()
+		
+		if !isClosed {
 			tc.lastUsed = time.Now()
-			return tc, false, nil // false = não é nova
+			return tc, false, nil // Reutilizar conexão existente
 		}
-		// Conexão expirada, fechar
-		if tc.conn != nil {
-			tc.conn.Close()
-		}
+		// Conexão fechada, remover e criar nova
 		delete(s.conns, dest)
 	}
 
@@ -102,28 +103,25 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 		conn:     conn,
 		dest:     dest,
 		lastUsed: time.Now(),
-		reading:  false,
+		reading:  true,
 	}
 	s.conns[dest] = tc
 
-	// Iniciar goroutine para ler respostas (apenas uma vez)
-	tc.reading = true
+	// Iniciar goroutine para ler respostas
 	go s.readFromTcp(tc, dest)
 
-	return tc, true, nil // true = é nova
+	return tc, true, nil
 }
 
 func (s *UserSession) readFromTcp(tc *TcpConn, dest string) {
 	buf := make([]byte, 32768)
-	emptyReads := 0
 	
 	for !tc.closed {
-		// Timeout de leitura mais longo - 120 segundos
-		tc.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		// Timeout de leitura - 30 segundos para esperar dados
+		tc.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := tc.conn.Read(buf)
 		
 		if n > 0 {
-			emptyReads = 0
 			tc.lastUsed = time.Now()
 			// Enviar dados de volta via WebSocket
 			s.sendToWs(dest, buf[:n])
@@ -132,28 +130,28 @@ func (s *UserSession) readFromTcp(tc *TcpConn, dest string) {
 		
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout - verificar se conexão ainda é necessária
-				if time.Since(tc.lastUsed) > 120*time.Second {
-					break // Conexão ociosa por muito tempo
+				// Timeout - conexão ainda pode ser válida
+				// Verificar se foi usada recentemente
+				if time.Since(tc.lastUsed) < 60*time.Second {
+					continue // Continuar esperando - conexão ainda ativa
 				}
-				emptyReads++
-				if emptyReads > 5 {
-					break // Muitos timeouts seguidos
-				}
-				continue // Continuar tentando ler
+				// Conexão ociosa por muito tempo, mas não fechar ainda
+				// Só sair do loop de leitura
+				break
 			}
-			// Erro real - fechar
+			// Erro real (EOF, connection reset, etc)
 			break
 		}
 	}
 	
+	// Marcar como fechada mas NÃO remover do mapa
+	// O cleanup vai remover depois
+	tc.mu.Lock()
 	tc.closed = true
-	tc.conn.Close()
-	
-	// Remover do pool
-	s.mu.Lock()
-	delete(s.conns, dest)
-	s.mu.Unlock()
+	if tc.conn != nil {
+		tc.conn.Close()
+	}
+	tc.mu.Unlock()
 }
 
 func (s *UserSession) sendToWs(dest string, data []byte) {
@@ -500,18 +498,21 @@ func handleWsTcp(session *UserSession, payload []byte, remoteIP string) {
 
 	tc, isNew, err := session.getOrCreateTcp(dest)
 	if err != nil {
-		// Só logar erros reais, não cada tentativa
 		return
 	}
 
 	if isNew {
 		fmt.Printf("[TCP+] %s\n", dest)
 	}
+	// Não logar reutilização para reduzir spam
 
 	tc.mu.Lock()
-	if len(data) > 0 {
+	if len(data) > 0 && !tc.closed {
 		tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		tc.conn.Write(data)
+		_, err := tc.conn.Write(data)
+		if err != nil {
+			tc.closed = true
+		}
 		tc.lastUsed = time.Now()
 	}
 	tc.mu.Unlock()
