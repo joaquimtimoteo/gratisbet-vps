@@ -273,13 +273,13 @@ func main() {
 	fmt.Println("  WebSocket + XOR - High Performance")
 	fmt.Println("══════════════════════════════════════════════")
 
-	ln, err := net.Listen("tcp", ":80")
+	ln, err := net.Listen("tcp", ":443")
 	if err != nil {
 		fmt.Printf("Erro: %v\n", err)
 		return
 	}
 
-	fmt.Println("  ✓ Porta 80 ativa")
+	fmt.Println("  ✓ Porta 443 ativa")
 	fmt.Println("  ✓ WebSocket: /ws")
 	fmt.Println("  ✓ DNS:       /tunnel")
 	fmt.Println("  ✓ Relay:     /relay (fallback)")
