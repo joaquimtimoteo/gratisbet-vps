@@ -15,10 +15,24 @@ import (
 	"time"
 )
 
-const SERVER_VERSION = "4.0-websocket"
+const SERVER_VERSION = "4.1-websocket"
+
+// ════════════════════════════════════════════════════════════════════
+//                    CONFIGURAÇÕES OTIMIZADAS
+// ════════════════════════════════════════════════════════════════════
+
+const (
+	BUFFER_SIZE      = 64 * 1024         // 64KB
+	CONN_TIMEOUT     = 30 * time.Second  // Timeout para conectar
+	READ_TIMEOUT     = 5 * time.Minute   // 5 min - manter conexões ativas
+	WRITE_TIMEOUT    = 30 * time.Second
+	IDLE_TIMEOUT     = 10 * time.Minute  // Conexão ociosa por 10 min
+	CLEANUP_INTERVAL = 2 * time.Minute
+	SESSION_TIMEOUT  = 30 * time.Minute
+)
 
 // XOR Key - mesma do app Android
-var XOR_KEY = []byte{0x47, 0x72, 0x61, 0x74, 0x69, 0x73, 0x42, 0x65, 0x74, 0x41, 0x6E, 0x67, 0x6F, 0x6C, 0x61, 0x21}
+var XOR_KEY = []byte("GratisBetAngola!")
 
 func xorData(data []byte) []byte {
 	result := make([]byte, len(data))
@@ -35,18 +49,32 @@ func xorData(data []byte) []byte {
 type TcpConn struct {
 	conn     net.Conn
 	dest     string
+	created  time.Time
 	lastUsed time.Time
 	mu       sync.Mutex
 	closed   bool
 	reading  bool
 }
 
+func (tc *TcpConn) isValid() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.closed {
+		return false
+	}
+	if time.Since(tc.lastUsed) > IDLE_TIMEOUT {
+		return false
+	}
+	return true
+}
+
 type UserSession struct {
 	mu       sync.RWMutex
-	conns    map[string]*TcpConn // dest -> connection
+	conns    map[string]*TcpConn
 	wsConn   net.Conn
 	wsMu     sync.Mutex
 	lastSeen time.Time
+	userIP   string
 }
 
 var sessions = struct {
@@ -57,13 +85,16 @@ var sessions = struct {
 func getSession(userIP string) *UserSession {
 	sessions.Lock()
 	defer sessions.Unlock()
+
 	if s, ok := sessions.m[userIP]; ok {
 		s.lastSeen = time.Now()
 		return s
 	}
+
 	s := &UserSession{
 		conns:    make(map[string]*TcpConn),
 		lastSeen: time.Now(),
+		userIP:   userIP,
 	}
 	sessions.m[userIP] = s
 	return s
@@ -73,84 +104,107 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Verificar se já existe conexão válida
+	// Verificar conexão existente
+	if tc, ok := s.conns[dest]; ok && tc.isValid() {
+		tc.mu.Lock()
+		tc.lastUsed = time.Now()
+		tc.mu.Unlock()
+		return tc, false, nil
+	}
+
+	// Remover conexão inválida
 	if tc, ok := s.conns[dest]; ok {
 		tc.mu.Lock()
-		isClosed := tc.closed
-		tc.mu.Unlock()
-		
-		if !isClosed {
-			tc.lastUsed = time.Now()
-			return tc, false, nil // Reutilizar conexão existente
+		tc.closed = true
+		if tc.conn != nil {
+			tc.conn.Close()
 		}
-		// Conexão fechada, remover e criar nova
+		tc.mu.Unlock()
 		delete(s.conns, dest)
 	}
 
 	// Criar nova conexão
-	conn, err := net.DialTimeout("tcp", dest, 15*time.Second)
+	dialer := &net.Dialer{
+		Timeout:   CONN_TIMEOUT,
+		KeepAlive: 30 * time.Second,
+	}
+
+	conn, err := dialer.Dial("tcp", dest)
 	if err != nil {
 		return nil, false, err
 	}
 
+	// Otimizações TCP
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(BUFFER_SIZE)
+		tcpConn.SetWriteBuffer(BUFFER_SIZE)
 	}
 
 	tc := &TcpConn{
 		conn:     conn,
 		dest:     dest,
+		created:  time.Now(),
 		lastUsed: time.Now(),
-		reading:  true,
 	}
 	s.conns[dest] = tc
 
-	// Iniciar goroutine para ler respostas
+	// Iniciar goroutine de leitura
 	go s.readFromTcp(tc, dest)
 
 	return tc, true, nil
 }
 
 func (s *UserSession) readFromTcp(tc *TcpConn, dest string) {
-	buf := make([]byte, 32768)
-	
-	for !tc.closed {
-		// Timeout de leitura - 30 segundos para esperar dados
-		tc.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	tc.mu.Lock()
+	if tc.reading {
+		tc.mu.Unlock()
+		return
+	}
+	tc.reading = true
+	tc.mu.Unlock()
+
+	buf := make([]byte, BUFFER_SIZE)
+
+	for {
+		tc.mu.Lock()
+		if tc.closed {
+			tc.mu.Unlock()
+			break
+		}
+		tc.mu.Unlock()
+
+		tc.conn.SetReadDeadline(time.Now().Add(READ_TIMEOUT))
 		n, err := tc.conn.Read(buf)
-		
+
 		if n > 0 {
+			tc.mu.Lock()
 			tc.lastUsed = time.Now()
-			// Enviar dados de volta via WebSocket
+			tc.mu.Unlock()
+
+			// Enviar via WebSocket
 			s.sendToWs(dest, buf[:n])
 			addBytes(int64(n))
 		}
-		
+
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout - conexão ainda pode ser válida
-				// Verificar se foi usada recentemente
-				if time.Since(tc.lastUsed) < 60*time.Second {
-					continue // Continuar esperando - conexão ainda ativa
+				tc.mu.Lock()
+				idle := time.Since(tc.lastUsed)
+				tc.mu.Unlock()
+				if idle < IDLE_TIMEOUT {
+					continue
 				}
-				// Conexão ociosa por muito tempo, mas não fechar ainda
-				// Só sair do loop de leitura
-				break
 			}
-			// Erro real (EOF, connection reset, etc)
 			break
 		}
 	}
-	
-	// Marcar como fechada mas NÃO remover do mapa
-	// O cleanup vai remover depois
+
 	tc.mu.Lock()
 	tc.closed = true
-	if tc.conn != nil {
-		tc.conn.Close()
-	}
+	tc.conn.Close()
 	tc.mu.Unlock()
 }
 
@@ -162,7 +216,7 @@ func (s *UserSession) sendToWs(dest string, data []byte) {
 		return
 	}
 
-	// Formato: tipo(1) + destLen(2) + dest + data (XOR encoded)
+	// Formato: tipo(1) + destLen(2) + dest + XOR(data)
 	msg := make([]byte, 0, 3+len(dest)+len(data))
 	msg = append(msg, 0x02) // tipo: data from server
 	msg = append(msg, byte(len(dest)>>8), byte(len(dest)))
@@ -172,32 +226,71 @@ func (s *UserSession) sendToWs(dest string, data []byte) {
 	writeWsFrame(s.wsConn, msg)
 }
 
-func (s *UserSession) closeTcp(dest string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tc, ok := s.conns[dest]; ok {
-		tc.closed = true
-		tc.conn.Close()
-		delete(s.conns, dest)
+func (s *UserSession) writeTcp(dest string, data []byte) error {
+	s.mu.RLock()
+	tc, ok := s.conns[dest]
+	s.mu.RUnlock()
+
+	if !ok || !tc.isValid() {
+		return fmt.Errorf("connection not found")
 	}
+
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	if tc.closed {
+		return fmt.Errorf("connection closed")
+	}
+
+	tc.conn.SetWriteDeadline(time.Now().Add(WRITE_TIMEOUT))
+	_, err := tc.conn.Write(data)
+	if err != nil {
+		tc.closed = true
+		return err
+	}
+
+	tc.lastUsed = time.Now()
+	return nil
 }
 
 func cleanupSessions() {
 	for {
-		time.Sleep(120 * time.Second) // Verificar a cada 2 minutos
+		time.Sleep(CLEANUP_INTERVAL)
+
 		sessions.Lock()
 		now := time.Now()
+
 		for ip, s := range sessions.m {
-			if now.Sub(s.lastSeen) > 30*time.Minute { // 30 minutos de inatividade
+			if now.Sub(s.lastSeen) > SESSION_TIMEOUT {
 				s.mu.Lock()
 				for _, tc := range s.conns {
+					tc.mu.Lock()
 					tc.closed = true
-					tc.conn.Close()
+					if tc.conn != nil {
+						tc.conn.Close()
+					}
+					tc.mu.Unlock()
 				}
 				s.mu.Unlock()
 				delete(sessions.m, ip)
+				fmt.Printf("[CLEANUP] Sessão removida: %s\n", ip)
+			} else {
+				s.mu.Lock()
+				for dest, tc := range s.conns {
+					if !tc.isValid() {
+						tc.mu.Lock()
+						tc.closed = true
+						if tc.conn != nil {
+							tc.conn.Close()
+						}
+						tc.mu.Unlock()
+						delete(s.conns, dest)
+					}
+				}
+				s.mu.Unlock()
 			}
 		}
+
 		sessions.Unlock()
 	}
 }
@@ -245,7 +338,11 @@ func countTcpConns() int {
 	count := 0
 	for _, s := range sessions.m {
 		s.mu.RLock()
-		count += len(s.conns)
+		for _, tc := range s.conns {
+			if tc.isValid() {
+				count++
+			}
+		}
 		s.mu.RUnlock()
 	}
 	return count
@@ -270,7 +367,9 @@ func getOnlineUsers() int {
 func main() {
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
-	fmt.Println("  WebSocket + XOR - High Performance")
+	fmt.Println("  WebSocket + XOR - OPTIMIZED")
+	fmt.Println("══════════════════════════════════════════════")
+	fmt.Printf("  Buffer: %dKB | Idle: %v\n", BUFFER_SIZE/1024, IDLE_TIMEOUT)
 	fmt.Println("══════════════════════════════════════════════")
 
 	ln, err := net.Listen("tcp", ":443")
@@ -282,21 +381,21 @@ func main() {
 	fmt.Println("  ✓ Porta 443 ativa")
 	fmt.Println("  ✓ WebSocket: /ws")
 	fmt.Println("  ✓ DNS:       /tunnel")
-	fmt.Println("  ✓ Relay:     /relay (fallback)")
 	fmt.Println("  ✓ Stats:     /stats")
 	fmt.Println("══════════════════════════════════════════════")
 
 	go cleanupSessions()
+
 	go func() {
 		for {
-			time.Sleep(60 * time.Second)
+			time.Sleep(30 * time.Second)
 			stats.RLock()
 			mb := float64(stats.TotalBytes) / 1024 / 1024
 			relay := stats.TotalRelay
 			ws := stats.WsConns
 			stats.RUnlock()
 			tcpConns := countTcpConns()
-			fmt.Printf("[STATS] Online: %d | WS: %d | TCP: %d | Relay: %d | %.2f MB\n",
+			fmt.Printf("[STATS] Users: %d | WS: %d | TCP: %d | Pkts: %d | %.2f MB\n",
 				getOnlineUsers(), ws, tcpConns, relay, mb)
 		}
 	}()
@@ -312,13 +411,22 @@ func main() {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetReadBuffer(BUFFER_SIZE)
+		tc.SetWriteBuffer(BUFFER_SIZE)
+	}
+
+	reader := bufio.NewReaderSize(conn, BUFFER_SIZE)
 	remoteIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return
 	}
+
 	parts := strings.Split(strings.TrimSpace(line), " ")
 	if len(parts) < 2 {
 		return
@@ -342,22 +450,13 @@ func handleConn(conn net.Conn) {
 		}
 	}
 
-	// Check for WebSocket upgrade
+	// WebSocket upgrade
 	if path == "/ws" && strings.ToLower(headers["upgrade"]) == "websocket" {
 		handleWebSocket(conn, headers, remoteIP)
 		return
 	}
 
-	fmt.Printf("[%s] %s %s de %s\n", time.Now().Format("15:04:05"), method, path, remoteIP)
-
 	switch {
-	case path == "/ws" && method == "GET":
-		// WebSocket sem upgrade header - enviar erro
-		send(conn, 400, "text/plain", []byte("WebSocket upgrade required"))
-
-	case path == "/relay" && method == "POST":
-		handleRelay(conn, reader, contentLength, remoteIP, headers)
-
 	case path == "/tunnel" && method == "POST":
 		handleTunnel(conn, reader, contentLength, remoteIP)
 
@@ -377,7 +476,6 @@ func handleConn(conn net.Conn) {
 // ════════════════════════════════════════════════════════════════════
 
 func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) {
-	// WebSocket handshake
 	key := headers["sec-websocket-key"]
 	if key == "" {
 		send(conn, 400, "text/plain", []byte("Missing Sec-WebSocket-Key"))
@@ -392,7 +490,7 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 
 	conn.Write([]byte(response))
 
-	fmt.Printf("[WS] Conexão estabelecida: %s\n", remoteIP)
+	fmt.Printf("[WS] Conectado: %s\n", remoteIP)
 	addWs(1)
 	defer addWs(-1)
 
@@ -401,8 +499,8 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 	session.wsConn = conn
 	session.wsMu.Unlock()
 
-	// Loop de leitura WebSocket
 	for {
+		conn.SetReadDeadline(time.Now().Add(READ_TIMEOUT))
 		frame, err := readWsFrame(conn)
 		if err != nil {
 			break
@@ -417,7 +515,7 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 
 		switch msgType {
 		case 0x01: // DNS request
-			handleWsDns(session, payload, remoteIP)
+			handleWsDns(session, payload)
 
 		case 0x02: // TCP data
 			handleWsTcp(session, payload, remoteIP)
@@ -427,24 +525,32 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 				destLen := int(payload[0])<<8 | int(payload[1])
 				if 2+destLen <= len(payload) {
 					dest := string(payload[2 : 2+destLen])
-					session.closeTcp(dest)
+					session.mu.Lock()
+					if tc, ok := session.conns[dest]; ok {
+						tc.mu.Lock()
+						tc.closed = true
+						tc.conn.Close()
+						tc.mu.Unlock()
+						delete(session.conns, dest)
+					}
+					session.mu.Unlock()
 				}
 			}
 
 		case 0x09: // Ping
-			writeWsFrame(conn, append([]byte{0x0A}, payload...)) // Pong
+			writeWsFrame(conn, append([]byte{0x0A}, payload...))
 		}
 
 		session.lastSeen = time.Now()
 	}
 
-	fmt.Printf("[WS] Conexão fechada: %s\n", remoteIP)
+	fmt.Printf("[WS] Desconectado: %s\n", remoteIP)
 	session.wsMu.Lock()
 	session.wsConn = nil
 	session.wsMu.Unlock()
 }
 
-func handleWsDns(session *UserSession, payload []byte, remoteIP string) {
+func handleWsDns(session *UserSession, payload []byte) {
 	if len(payload) < 2 {
 		return
 	}
@@ -463,12 +569,10 @@ func handleWsDns(session *UserSession, payload []byte, remoteIP string) {
 
 	addDNS()
 
-	// Resolver DNS
 	response := resolveDNS(dest, data)
 
-	// Enviar resposta via WebSocket
 	msg := make([]byte, 0, 3+len(dest)+len(response))
-	msg = append(msg, 0x01) // tipo: DNS response
+	msg = append(msg, 0x01)
 	msg = append(msg, byte(len(dest)>>8), byte(len(dest)))
 	msg = append(msg, []byte(dest)...)
 	msg = append(msg, response...)
@@ -491,11 +595,12 @@ func handleWsTcp(session *UserSession, payload []byte, remoteIP string) {
 	}
 
 	dest := string(payload[2 : 2+destLen])
-	data := xorData(payload[2+destLen:]) // Decodificar XOR
+	data := xorData(payload[2+destLen:])
 
 	addRelay()
 	addBytes(int64(len(data)))
 
+	// Obter ou criar conexão
 	tc, isNew, err := session.getOrCreateTcp(dest)
 	if err != nil {
 		return
@@ -504,18 +609,23 @@ func handleWsTcp(session *UserSession, payload []byte, remoteIP string) {
 	if isNew {
 		fmt.Printf("[TCP+] %s\n", dest)
 	}
-	// Não logar reutilização para reduzir spam
 
-	tc.mu.Lock()
-	if len(data) > 0 && !tc.closed {
-		tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		_, err := tc.conn.Write(data)
-		if err != nil {
-			tc.closed = true
+	// Escrever dados
+	if len(data) > 0 {
+		if err := session.writeTcp(dest, data); err != nil {
+			session.mu.Lock()
+			delete(session.conns, dest)
+			session.mu.Unlock()
+
+			tc, _, err = session.getOrCreateTcp(dest)
+			if err != nil {
+				return
+			}
+			session.writeTcp(dest, data)
 		}
-		tc.lastUsed = time.Now()
 	}
-	tc.mu.Unlock()
+
+	_ = tc
 }
 
 func resolveDNS(dest string, query []byte) []byte {
@@ -554,7 +664,6 @@ func readWsFrame(conn net.Conn) ([]byte, error) {
 		return nil, err
 	}
 
-	// opcode := header[0] & 0x0F
 	masked := (header[1] & 0x80) != 0
 	length := int(header[1] & 0x7F)
 
@@ -599,7 +708,7 @@ func writeWsFrame(conn net.Conn, data []byte) error {
 	var header []byte
 
 	if length < 126 {
-		header = []byte{0x82, byte(length)} // Binary frame
+		header = []byte{0x82, byte(length)}
 	} else if length < 65536 {
 		header = []byte{0x82, 126, byte(length >> 8), byte(length)}
 	} else {
@@ -609,7 +718,7 @@ func writeWsFrame(conn net.Conn, data []byte) error {
 		binary.BigEndian.PutUint64(header[2:], uint64(length))
 	}
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(WRITE_TIMEOUT))
 	if _, err := conn.Write(header); err != nil {
 		return err
 	}
@@ -618,88 +727,8 @@ func writeWsFrame(conn net.Conn, data []byte) error {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//                    HTTP FALLBACK (relay/tunnel)
+//                    DNS FALLBACK
 // ════════════════════════════════════════════════════════════════════
-
-func handleRelay(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string, headers map[string]string) {
-	body := make([]byte, contentLength)
-	if contentLength > 0 {
-		if _, err := io.ReadFull(reader, body); err != nil {
-			send(conn, 400, "application/json", []byte(`{"error":"read"}`))
-			return
-		}
-	}
-
-	useXOR := headers["x-xor"] == "1"
-	var req struct {
-		Dest string `json:"dest"`
-		Data string `json:"data"`
-	}
-	json.Unmarshal(body, &req)
-
-	if req.Dest == "" {
-		send(conn, 400, "application/json", []byte(`{"error":"missing dest"}`))
-		return
-	}
-
-	dataBytes, _ := base64.StdEncoding.DecodeString(req.Data)
-	if useXOR && len(dataBytes) > 0 {
-		dataBytes = xorData(dataBytes)
-	}
-
-	session := getSession(remoteIP)
-	tc, isNew, err := session.getOrCreateTcp(req.Dest)
-	if err != nil {
-		send(conn, 502, "application/json", []byte(`{"error":"connect failed"}`))
-		return
-	}
-
-	if isNew {
-		fmt.Printf("[RELAY] Nova conexão: %s\n", req.Dest)
-	}
-
-	addRelay()
-	addBytes(int64(len(dataBytes)))
-
-	tc.mu.Lock()
-	if len(dataBytes) > 0 {
-		tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		tc.conn.Write(dataBytes)
-	}
-
-	// Ler resposta
-	tc.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	response := make([]byte, 0, 65536)
-	buf := make([]byte, 8192)
-	for {
-		n, err := tc.conn.Read(buf)
-		if n > 0 {
-			response = append(response, buf[:n]...)
-			tc.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		}
-		if err != nil {
-			break
-		}
-		if len(response) > 1024*1024 {
-			break
-		}
-	}
-	tc.mu.Unlock()
-
-	addBytes(int64(len(response)))
-
-	respData := response
-	if useXOR && len(response) > 0 {
-		respData = xorData(response)
-	}
-
-	respJSON, _ := json.Marshal(map[string]interface{}{
-		"status": "ok",
-		"data":   base64.StdEncoding.EncodeToString(respData),
-		"size":   len(response),
-	})
-	send(conn, 200, "application/json", respJSON)
-}
 
 func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remoteIP string) {
 	if contentLength < 3 {
@@ -729,7 +758,7 @@ func handleTunnel(conn net.Conn, reader *bufio.Reader, contentLength int, remote
 		return
 	}
 
-	send(conn, 400, "text/plain", []byte("Use /relay for TCP"))
+	send(conn, 400, "text/plain", []byte("Use WebSocket for TCP"))
 }
 
 func sendStats(conn net.Conn) {
@@ -744,6 +773,7 @@ func sendStats(conn net.Conn) {
 		"mb":         float64(stats.TotalBytes) / 1024 / 1024,
 		"uptime":     time.Since(stats.StartTime).String(),
 		"goroutines": runtime.NumGoroutine(),
+		"buffer_kb":  BUFFER_SIZE / 1024,
 	}
 	stats.RUnlock()
 	j, _ := json.MarshalIndent(s, "", "  ")
