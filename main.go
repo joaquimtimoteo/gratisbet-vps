@@ -15,23 +15,22 @@ import (
 	"time"
 )
 
-const SERVER_VERSION = "4.1-websocket"
+const SERVER_VERSION = "4.2-websocket"
 
 // ════════════════════════════════════════════════════════════════════
 //                    CONFIGURAÇÕES OTIMIZADAS
 // ════════════════════════════════════════════════════════════════════
 
 const (
-	BUFFER_SIZE      = 64 * 1024         // 64KB
-	CONN_TIMEOUT     = 30 * time.Second  // Timeout para conectar
-	READ_TIMEOUT     = 5 * time.Minute   // 5 min - manter conexões ativas
+	BUFFER_SIZE      = 64 * 1024
+	CONN_TIMEOUT     = 30 * time.Second
+	READ_TIMEOUT     = 5 * time.Minute
 	WRITE_TIMEOUT    = 30 * time.Second
-	IDLE_TIMEOUT     = 10 * time.Minute  // Conexão ociosa por 10 min
+	IDLE_TIMEOUT     = 10 * time.Minute
 	CLEANUP_INTERVAL = 2 * time.Minute
 	SESSION_TIMEOUT  = 30 * time.Minute
 )
 
-// XOR Key - mesma do app Android
 var XOR_KEY = []byte("GratisBetAngola!")
 
 func xorData(data []byte) []byte {
@@ -43,7 +42,7 @@ func xorData(data []byte) []byte {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//                    POOL DE CONEXÕES TCP
+//                    SESSÕES DE USUÁRIO
 // ════════════════════════════════════════════════════════════════════
 
 type TcpConn struct {
@@ -59,19 +58,14 @@ type TcpConn struct {
 func (tc *TcpConn) isValid() bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-	if tc.closed {
-		return false
-	}
-	if time.Since(tc.lastUsed) > IDLE_TIMEOUT {
-		return false
-	}
-	return true
+	return !tc.closed && time.Since(tc.lastUsed) <= IDLE_TIMEOUT
 }
 
 type UserSession struct {
 	mu       sync.RWMutex
 	conns    map[string]*TcpConn
 	wsConn   net.Conn
+	wsID     int64 // ID único para cada conexão WS
 	wsMu     sync.Mutex
 	lastSeen time.Time
 	userIP   string
@@ -81,6 +75,16 @@ var sessions = struct {
 	sync.RWMutex
 	m map[string]*UserSession
 }{m: make(map[string]*UserSession)}
+
+var wsCounter int64
+var wsCounterMu sync.Mutex
+
+func nextWsID() int64 {
+	wsCounterMu.Lock()
+	defer wsCounterMu.Unlock()
+	wsCounter++
+	return wsCounter
+}
 
 func getSession(userIP string) *UserSession {
 	sessions.Lock()
@@ -100,11 +104,43 @@ func getSession(userIP string) *UserSession {
 	return s
 }
 
+// setWebSocket fecha conexão antiga e define nova
+// Retorna o ID da nova conexão
+func (s *UserSession) setWebSocket(conn net.Conn) int64 {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+
+	// Fechar conexão antiga se existir
+	if s.wsConn != nil {
+		fmt.Printf("[WS] Fechando conexão antiga de %s\n", s.userIP)
+		s.wsConn.Close()
+	}
+
+	s.wsConn = conn
+	s.wsID = nextWsID()
+	return s.wsID
+}
+
+// isCurrentWs verifica se o ID é da conexão atual
+func (s *UserSession) isCurrentWs(id int64) bool {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return s.wsID == id
+}
+
+func (s *UserSession) clearWebSocket(id int64) {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	// Só limpa se for a mesma conexão
+	if s.wsID == id {
+		s.wsConn = nil
+	}
+}
+
 func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Verificar conexão existente
 	if tc, ok := s.conns[dest]; ok && tc.isValid() {
 		tc.mu.Lock()
 		tc.lastUsed = time.Now()
@@ -112,7 +148,6 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 		return tc, false, nil
 	}
 
-	// Remover conexão inválida
 	if tc, ok := s.conns[dest]; ok {
 		tc.mu.Lock()
 		tc.closed = true
@@ -123,7 +158,6 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 		delete(s.conns, dest)
 	}
 
-	// Criar nova conexão
 	dialer := &net.Dialer{
 		Timeout:   CONN_TIMEOUT,
 		KeepAlive: 30 * time.Second,
@@ -134,7 +168,6 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 		return nil, false, err
 	}
 
-	// Otimizações TCP
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
@@ -151,7 +184,6 @@ func (s *UserSession) getOrCreateTcp(dest string) (*TcpConn, bool, error) {
 	}
 	s.conns[dest] = tc
 
-	// Iniciar goroutine de leitura
 	go s.readFromTcp(tc, dest)
 
 	return tc, true, nil
@@ -184,7 +216,6 @@ func (s *UserSession) readFromTcp(tc *TcpConn, dest string) {
 			tc.lastUsed = time.Now()
 			tc.mu.Unlock()
 
-			// Enviar via WebSocket
 			s.sendToWs(dest, buf[:n])
 			addBytes(int64(n))
 		}
@@ -216,9 +247,8 @@ func (s *UserSession) sendToWs(dest string, data []byte) {
 		return
 	}
 
-	// Formato: tipo(1) + destLen(2) + dest + XOR(data)
 	msg := make([]byte, 0, 3+len(dest)+len(data))
-	msg = append(msg, 0x02) // tipo: data from server
+	msg = append(msg, 0x02)
 	msg = append(msg, byte(len(dest)>>8), byte(len(dest)))
 	msg = append(msg, []byte(dest)...)
 	msg = append(msg, xorData(data)...)
@@ -305,7 +335,6 @@ var stats = struct {
 	TotalBytes int64
 	TotalRelay int64
 	TotalDNS   int64
-	WsConns    int64
 }{StartTime: time.Now()}
 
 func addBytes(n int64) {
@@ -326,10 +355,18 @@ func addDNS() {
 	stats.Unlock()
 }
 
-func addWs(delta int64) {
-	stats.Lock()
-	stats.WsConns += delta
-	stats.Unlock()
+func countWsConns() int {
+	sessions.RLock()
+	defer sessions.RUnlock()
+	count := 0
+	for _, s := range sessions.m {
+		s.wsMu.Lock()
+		if s.wsConn != nil {
+			count++
+		}
+		s.wsMu.Unlock()
+	}
+	return count
 }
 
 func countTcpConns() int {
@@ -367,7 +404,7 @@ func getOnlineUsers() int {
 func main() {
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Println("  GRATISBET VPN SERVER v" + SERVER_VERSION)
-	fmt.Println("  WebSocket + XOR - OPTIMIZED")
+	fmt.Println("  WebSocket + XOR - SINGLE CONNECTION PER IP")
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Printf("  Buffer: %dKB | Idle: %v\n", BUFFER_SIZE/1024, IDLE_TIMEOUT)
 	fmt.Println("══════════════════════════════════════════════")
@@ -379,7 +416,7 @@ func main() {
 	}
 
 	fmt.Println("  ✓ Porta 443 ativa")
-	fmt.Println("  ✓ WebSocket: /ws")
+	fmt.Println("  ✓ WebSocket: /ws (1 por IP)")
 	fmt.Println("  ✓ DNS:       /tunnel")
 	fmt.Println("  ✓ Stats:     /stats")
 	fmt.Println("══════════════════════════════════════════════")
@@ -392,11 +429,11 @@ func main() {
 			stats.RLock()
 			mb := float64(stats.TotalBytes) / 1024 / 1024
 			relay := stats.TotalRelay
-			ws := stats.WsConns
 			stats.RUnlock()
+			wsConns := countWsConns()
 			tcpConns := countTcpConns()
 			fmt.Printf("[STATS] Users: %d | WS: %d | TCP: %d | Pkts: %d | %.2f MB\n",
-				getOnlineUsers(), ws, tcpConns, relay, mb)
+				getOnlineUsers(), wsConns, tcpConns, relay, mb)
 		}
 	}()
 
@@ -450,7 +487,6 @@ func handleConn(conn net.Conn) {
 		}
 	}
 
-	// WebSocket upgrade
 	if path == "/ws" && strings.ToLower(headers["upgrade"]) == "websocket" {
 		handleWebSocket(conn, headers, remoteIP)
 		return
@@ -490,16 +526,21 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 
 	conn.Write([]byte(response))
 
-	fmt.Printf("[WS] Conectado: %s\n", remoteIP)
-	addWs(1)
-	defer addWs(-1)
-
 	session := getSession(remoteIP)
-	session.wsMu.Lock()
-	session.wsConn = conn
-	session.wsMu.Unlock()
+	
+	// IMPORTANTE: Fecha conexão antiga e define nova
+	wsID := session.setWebSocket(conn)
+	
+	fmt.Printf("[WS] Conectado: %s (ID: %d)\n", remoteIP, wsID)
 
+	// Loop de leitura
 	for {
+		// Verificar se ainda somos a conexão ativa
+		if !session.isCurrentWs(wsID) {
+			fmt.Printf("[WS] Substituído por nova conexão: %s (ID: %d)\n", remoteIP, wsID)
+			return // Sair sem fechar (já foi substituído)
+		}
+
 		conn.SetReadDeadline(time.Now().Add(READ_TIMEOUT))
 		frame, err := readWsFrame(conn)
 		if err != nil {
@@ -544,10 +585,8 @@ func handleWebSocket(conn net.Conn, headers map[string]string, remoteIP string) 
 		session.lastSeen = time.Now()
 	}
 
-	fmt.Printf("[WS] Desconectado: %s\n", remoteIP)
-	session.wsMu.Lock()
-	session.wsConn = nil
-	session.wsMu.Unlock()
+	fmt.Printf("[WS] Desconectado: %s (ID: %d)\n", remoteIP, wsID)
+	session.clearWebSocket(wsID)
 }
 
 func handleWsDns(session *UserSession, payload []byte) {
@@ -600,17 +639,15 @@ func handleWsTcp(session *UserSession, payload []byte, remoteIP string) {
 	addRelay()
 	addBytes(int64(len(data)))
 
-	// Obter ou criar conexão
 	tc, isNew, err := session.getOrCreateTcp(dest)
 	if err != nil {
 		return
 	}
 
 	if isNew {
-		fmt.Printf("[TCP+] %s\n", dest)
+		fmt.Printf("[TCP+] %s -> %s\n", remoteIP, dest)
 	}
 
-	// Escrever dados
 	if len(data) > 0 {
 		if err := session.writeTcp(dest, data); err != nil {
 			session.mu.Lock()
@@ -766,7 +803,7 @@ func sendStats(conn net.Conn) {
 	s := map[string]interface{}{
 		"version":    SERVER_VERSION,
 		"online":     getOnlineUsers(),
-		"websockets": stats.WsConns,
+		"websockets": countWsConns(),
 		"tcp_conns":  countTcpConns(),
 		"relay":      stats.TotalRelay,
 		"dns":        stats.TotalDNS,
