@@ -18,7 +18,7 @@ const SERVER_VERSION = "5.0-kaiho-style"
 // ════════════════════════════════════════════════════════════════════
 
 const (
-	LISTEN_PORT    = ":82"
+	LISTEN_PORT    = ":443"
 	BUFFER_SIZE    = 64 * 1024
 	CONN_TIMEOUT   = 30 * time.Second
 	RELAY_TIMEOUT  = 5 * time.Minute
