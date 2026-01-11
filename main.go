@@ -2,7 +2,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"runtime"
 	"strings"
@@ -11,24 +19,24 @@ import (
 	"time"
 )
 
-const SERVER_VERSION = "5.0-kaiho-style"
+const SERVER_VERSION = "6.0-tls-proxy"
 
 // ════════════════════════════════════════════════════════════════════
 //                    CONFIGURAÇÕES
 // ════════════════════════════════════════════════════════════════════
 
 const (
-	LISTEN_PORT    = ":443"
-	BUFFER_SIZE    = 64 * 1024
-	CONN_TIMEOUT   = 30 * time.Second
-	RELAY_TIMEOUT  = 5 * time.Minute
+	LISTEN_PORT   = ":443"
+	BUFFER_SIZE   = 64 * 1024
+	CONN_TIMEOUT  = 30 * time.Second
+	RELAY_TIMEOUT = 5 * time.Minute
 )
 
 var (
-	activeConns   int64
-	totalConns    int64
-	totalBytes    int64
-	startTime     = time.Now()
+	activeConns int64
+	totalConns  int64
+	totalBytes  int64
+	startTime   = time.Now()
 )
 
 func main() {
@@ -36,18 +44,30 @@ func main() {
 
 	fmt.Println("══════════════════════════════════════════════")
 	fmt.Println("  GRATISBET PROXY v" + SERVER_VERSION)
-	fmt.Println("  HTTP CONNECT + SNI Style")
+	fmt.Println("  TLS + HTTP CONNECT")
 	fmt.Println("══════════════════════════════════════════════")
 
-	ln, err := net.Listen("tcp", LISTEN_PORT)
+	// Gerar certificado auto-assinado
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		fmt.Printf("Erro gerando certificado: %v\n", err)
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	ln, err := tls.Listen("tcp", LISTEN_PORT, tlsConfig)
 	if err != nil {
 		fmt.Printf("Erro ao iniciar: %v\n", err)
 		return
 	}
 
-	fmt.Printf("  ✓ Porta %s ativa\n", LISTEN_PORT)
-	fmt.Println("  ✓ Método: HTTP CONNECT Proxy")
-	fmt.Println("  ✓ SNI: Preservado do cliente")
+	fmt.Printf("  ✓ Porta %s ativa (TLS)\n", LISTEN_PORT)
+	fmt.Println("  ✓ Método: TLS + HTTP CONNECT")
+	fmt.Println("  ✓ Certificado: Auto-assinado")
 	fmt.Println("══════════════════════════════════════════════")
 
 	// Stats
@@ -77,22 +97,15 @@ func handleConnection(clientConn net.Conn) {
 	atomic.AddInt64(&totalConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
 
-	// Configurar TCP
-	if tc, ok := clientConn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-		tc.SetKeepAlive(true)
-	}
-
 	reader := bufio.NewReader(clientConn)
 	clientConn.SetReadDeadline(time.Now().Add(CONN_TIMEOUT))
 
-	// Ler primeira linha (ex: CONNECT google.com:443 HTTP/1.1)
+	// Ler primeira linha
 	firstLine, err := reader.ReadString('\n')
 	if err != nil {
 		return
 	}
 
-	// Parse da requisição
 	parts := strings.Fields(firstLine)
 	if len(parts) < 2 {
 		return
@@ -116,34 +129,23 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	clientConn.SetReadDeadline(time.Time{})
-
-	// Log
 	clientIP := strings.Split(clientConn.RemoteAddr().String(), ":")[0]
 
 	switch method {
 	case "CONNECT":
-		// Método CONNECT - túnel direto
 		handleConnect(clientConn, target, clientIP)
-
 	default:
-		// Outros métodos (GET, POST, etc) - proxy HTTP
 		handleHTTPProxy(clientConn, reader, method, target, headers, clientIP)
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════
-//                    CONNECT TUNNEL
-// ════════════════════════════════════════════════════════════════════
-
 func handleConnect(clientConn net.Conn, target string, clientIP string) {
-	// Garantir que tem porta
 	if !strings.Contains(target, ":") {
 		target = target + ":443"
 	}
 
 	fmt.Printf("[CONNECT] %s -> %s\n", clientIP, target)
 
-	// Conectar ao destino
 	serverConn, err := net.DialTimeout("tcp", target, CONN_TIMEOUT)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
@@ -151,28 +153,19 @@ func handleConnect(clientConn net.Conn, target string, clientIP string) {
 	}
 	defer serverConn.Close()
 
-	// Configurar TCP
 	if tc, ok := serverConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 	}
 
-	// Responder 200 OK
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Relay bidirecional
 	relay(clientConn, serverConn)
 }
 
-// ════════════════════════════════════════════════════════════════════
-//                    HTTP PROXY
-// ════════════════════════════════════════════════════════════════════
-
 func handleHTTPProxy(clientConn net.Conn, reader *bufio.Reader, method, target string, headers map[string]string, clientIP string) {
-	// Extrair host do target ou header
 	host := headers["host"]
 	if host == "" {
-		// Tentar extrair do URL
 		if strings.HasPrefix(target, "http://") {
 			target = target[7:]
 			if idx := strings.Index(target, "/"); idx > 0 {
@@ -189,14 +182,12 @@ func handleHTTPProxy(clientConn net.Conn, reader *bufio.Reader, method, target s
 		return
 	}
 
-	// Adicionar porta se não tiver
 	if !strings.Contains(host, ":") {
 		host = host + ":80"
 	}
 
 	fmt.Printf("[HTTP] %s -> %s%s\n", clientIP, host, target)
 
-	// Conectar ao servidor
 	serverConn, err := net.DialTimeout("tcp", host, CONN_TIMEOUT)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
@@ -204,7 +195,6 @@ func handleHTTPProxy(clientConn net.Conn, reader *bufio.Reader, method, target s
 	}
 	defer serverConn.Close()
 
-	// Reenviar request
 	request := fmt.Sprintf("%s %s HTTP/1.1\r\n", method, target)
 	for k, v := range headers {
 		request += fmt.Sprintf("%s: %s\r\n", k, v)
@@ -212,33 +202,23 @@ func handleHTTPProxy(clientConn net.Conn, reader *bufio.Reader, method, target s
 	request += "\r\n"
 
 	serverConn.Write([]byte(request))
-
-	// Relay
 	relay(clientConn, serverConn)
 }
-
-// ════════════════════════════════════════════════════════════════════
-//                    RELAY
-// ════════════════════════════════════════════════════════════════════
 
 func relay(client, server net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Server
 	go func() {
 		defer wg.Done()
 		n, _ := copyBuffer(server, client)
 		atomic.AddInt64(&totalBytes, n)
-		server.(*net.TCPConn).CloseWrite()
 	}()
 
-	// Server -> Client
 	go func() {
 		defer wg.Done()
 		n, _ := copyBuffer(client, server)
 		atomic.AddInt64(&totalBytes, n)
-		client.(*net.TCPConn).CloseWrite()
 	}()
 
 	wg.Wait()
@@ -263,4 +243,46 @@ func copyBuffer(dst, src net.Conn) (int64, error) {
 			return total, err
 		}
 	}
+}
+
+// ════════════════════════════════════════════════════════════════════
+//                    CERTIFICADO AUTO-ASSINADO
+// ════════════════════════════════════════════════════════════════════
+
+func generateSelfSignedCert() (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"GratisBet VPN"},
+			CommonName:   "gratisbet.local",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"gratisbet.local", "localhost"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	privDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privDER})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
